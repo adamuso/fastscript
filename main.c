@@ -12,6 +12,8 @@ enum {
     STACK_TYPE_FUNCTION
 };
 
+#define MAX_IDENTIFIER_LENGTH 32
+
 void exec(const char* code);
 
 int main() 
@@ -21,19 +23,18 @@ int main()
         print(a); \
         a = add(a, 10); \
         print(a); \
-        // b = () => {}; \n\
+        b = []() => {}; \n\
     ");
     return 0;
 }
 
-//
-//
-//
-//
 
+
+
+#pragma region --- CONTEXT ---
 struct ExecutionContextVariable
 {
-    char name[32];
+    char name[MAX_IDENTIFIER_LENGTH];
     uint64_t value;
     uint8_t type;
 };
@@ -68,15 +69,33 @@ struct ExecutionContextVariableInfo
     struct ExecutionContextVariable* variable;
 };
 
+
+void context_scope_init(struct ExecutionContext* context)
+{
+    context->scopes[context->scope_index].variable_count = 0;
+}
+
 struct ExecutionContextScope* context_get_scope(struct ExecutionContext* context)
 {
     return &context->scopes[context->scope_index];
 }
 
+struct ExecutionContextScope* context_push_scope(struct ExecutionContext* context)
+{
+    context->scope_index++;
+    context_scope_init(context);
+    return context_get_scope(context);
+}
+
+int context_eof(struct ExecutionContext* context)
+{
+    return context->position >= context->code_len;    
+}
+
 void context_skip_spaces(struct ExecutionContext* context)
 {
-    char* current = &context->code[context->position];
-    char* eof = context->code + context->code_len;
+    const char* current = &context->code[context->position];
+    const char* eof = context->code + context->code_len;
 
     while (isspace(*current) && current < eof) 
     { 
@@ -145,15 +164,10 @@ struct ExecutionContextStackValue context_stack_get_value_at_index(struct Execut
     return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index] };
 }
 
-void context_scope_init(struct ExecutionContext* context)
-{
-    context->scopes[context->scope_index].variable_count = 0;
-}
-
 struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionContextScope* scope, const char* name)
 {
     int index = scope->variable_count++;
-    strncpy(scope->variables[index].name, name, 32);
+    strncpy(scope->variables[index].name, name, MAX_IDENTIFIER_LENGTH);
     scope->variables[index].value = 0;
     scope->variables[index].type = 0;
 
@@ -163,6 +177,13 @@ struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionC
 
     return (struct ExecutionContextVariableInfo) { .index = index, .variable = &scope->variables[index] };
 }
+
+void context_set_variable(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, uint64_t value, uint8_t type)
+{
+    info.variable->value = value;
+    info.variable->type = type;
+}
+
 
 void context_set_variable_ptr(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, void* ptr, uint8_t type)
 {
@@ -193,6 +214,34 @@ struct ExecutionContextVariableInfo context_scope_lookup_variable(struct Executi
 
     return (struct ExecutionContextVariableInfo) { .index = lookup, .variable = &scope->variables[lookup] };
 }
+
+#pragma endregion --- CONTEXT ---
+
+
+#pragma region --- PARSER ---
+
+int parse_identifier(struct ExecutionContext* context, char* buffer, int max_len)
+{
+    const char* source = &context->code[context->position];
+    char* destination = buffer;
+    char* destination_end = destination + max_len;
+
+    while (
+        (isalpha(*source) || isdigit(*source)) 
+        && !context_eof(context) 
+        && destination < destination_end - 1
+    ) {
+        *destination = *source;
+        context->position++;
+        destination++;
+        source++;
+    }
+
+    *destination = 0;
+    return destination - buffer;
+}
+
+#pragma endregion --- PARSER ---
 
 void exec_expression(struct ExecutionContext* context);
 
@@ -351,25 +400,33 @@ void exec_function(struct ExecutionContext* context)
     if (current == '{')
     {
         context->position++;
-    }
 
-    context_skip_spaces(context);
+        context_skip_spaces(context);
 
-    int nested = 1;
+        int nested = 1;
 
-    while (nested > 0)
-    {
-        current = context->code[context->position];
-        context->position++;
-
-        if (current == '{')
+        while (nested > 0)
         {
-            nested++;
+            current = context->code[context->position];
+            context->position++;
+
+            if (current == '{')
+            {
+                nested++;
+            }
+            else if (current == '}')
+            {
+                nested--;
+            } 
         }
-        else if (current == '}')
+    }
+    else 
+    {
+        while (current != ';' && !context_eof(context))
         {
-            nested--;
-        } 
+            current = context->code[context->position];
+            context->position++;
+        }
     }
 
     context_push_stack(context, code_start, STACK_TYPE_FUNCTION);
@@ -377,19 +434,8 @@ void exec_function(struct ExecutionContext* context)
 
 struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* context)
 {
-    char identifier[32];
-    int index = 0;
-    char current = context->code[context->position];
-
-    while ((isalpha(current) || isdigit(current)) && context->position < context->code_len)
-    {
-        identifier[index] = current;
-        index++;
-        context->position++;
-        current = context->code[context->position];
-    }
-
-    identifier[index] = 0;
+    char identifier[MAX_IDENTIFIER_LENGTH];
+    parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
     
     struct ExecutionContextVariableInfo variable = context_scope_lookup_variable(context_get_scope(context), identifier);
 
@@ -413,43 +459,34 @@ void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVa
     variable->type = value.type;
 }
 
-void exec_call_native_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
+int exec_call_args(struct ExecutionContext* context, int start_stack_index) 
 {
-    if (stack_value.type != STACK_TYPE_NATIVE_FUNCTION)
-    {
-        printf("ERR!: Value is not a function\n");
-        return;
-    }
+    // Parsing an expression here, because ',' operator pushes all expressions 
+    // into a stack, which means this will populate arguments for this call
+    exec_expression(context);
 
     char current = context->code[context->position];
 
-    void(*func)(struct ExecutionContext*) = (void*)stack_value.value;
-    int start_stack_index = context->stack_index;
+    // We should be at ')', if not there is something wrong with syntax
+    if (current == ')')
+    {
+        context->position++;
+    }
+    else 
+    {
+        printf("ERR!: Syntax error missing ')'\n");
+        // FIXME: should panic
+        return 0;
+    }
 
-    #ifdef TOKEN_DEBUG
-        printf("Prepare to call %p\n", func);
-    #endif
-
-    // do
-    // {
-        exec_expression(context);
-        current = context->code[context->position];
-
-        if (current == ')')
-        {
-            context->position++;
-        }
-    // }
-    // while (current == ',' && context->position < context->code_len);
-
+    // Provided args count pushed to the stack can be calculated
     int args_count = context->stack_index - start_stack_index;
 
-    #ifdef TOKEN_DEBUG
-        printf("Calling %p with %d arguments\n", func, args_count);
-    #endif
+    return args_count;
+}
 
-    func(context);
-
+void exec_call_cleanup(struct ExecutionContext* context, int start_stack_index, int args_count) 
+{
     int return_count = context->stack_index - (start_stack_index + args_count);
     int to_pop = args_count - return_count + 1;
 
@@ -468,6 +505,34 @@ void exec_call_native_function(struct ExecutionContextStackValue stack_value, st
     }
 }
 
+void exec_call_native_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
+{
+    if (stack_value.type != STACK_TYPE_NATIVE_FUNCTION)
+    {
+        printf("ERR!: Value is not a function\n");
+        return;
+    }
+
+    char current = context->code[context->position];
+
+    void(*func)(struct ExecutionContext*) = (void*)stack_value.value;
+    int start_stack_index = context->stack_index;
+
+    #ifdef TOKEN_DEBUG
+        printf("Prepare to call %p\n", func);
+    #endif
+
+    int args_count = exec_call_args(context, start_stack_index);
+
+    #ifdef TOKEN_DEBUG
+        printf("Calling %p with %d arguments\n", func, args_count);
+    #endif
+
+    func(context);
+
+    exec_call_cleanup(context, start_stack_index, args_count);
+}
+
 void exec_call_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
 {
     if (stack_value.type != STACK_TYPE_FUNCTION)
@@ -476,7 +541,84 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
         return;
     }
 
+    // Stack value contains start text position for the function, currently
+    // it should point to place directly after '(' character
+    int func_position = stack_value.value;
+    // Save start stack index for later, we need to restore it after
+    // function call is done 
+    int start_stack_index = context->stack_index;
 
+    #ifdef TOKEN_DEBUG
+        printf("Prepare to call %p\n", func_position);
+    #endif
+
+    int return_position = exec_call_args(context, start_stack_index);
+
+    // Provided args count pushed to the stack can be calculated
+    int args_count = context->stack_index - start_stack_index;
+
+    context->position = func_position;
+    context_skip_spaces(context);
+    char current = context->code[context->position];
+
+    struct ExecutionContextScope* scope = context_push_scope(context);
+
+    if (current != ')')
+    {
+        // Args on the stack needs to be assinged to scope variables
+        int index = 0;
+
+        do
+        {
+            struct ExecutionContextStackValue arg_stack_value = context_stack_get_value_at_index(context, start_stack_index + index);
+            index++;
+
+            char identifier[MAX_IDENTIFIER_LENGTH];
+            context_skip_spaces(context);
+            parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+            context_skip_spaces(context);
+
+            struct ExecutionContextVariableInfo info =  context_scope_add_variable(scope, identifier);
+            context_set_variable(context, info, stack_value.value, stack_value.type);
+            current = context->code[context->position];
+        }
+        while (current == ',');
+
+        if (current == ')')
+        {
+            context->position++;
+        }
+        else 
+        {
+            printf("ERR!: Syntax error missing ')'\n");
+            // FIXME: should panic
+            return;
+        }
+    }
+
+    context_skip_spaces(context);
+
+    current = context->code[context->position];
+
+    if (current == '=')
+    {
+        context->position++;
+    }
+
+    context_skip_spaces(context);
+
+    current = context->code[context->position];
+
+    if (current == '>')
+    {
+        context->position++;
+    }
+
+    exec_expression(context);
+
+    context->position = return_position;
+    
+    exec_call_cleanup(context, start_stack_index, args_count);
 }
 
 void exec_call(struct ExecutionContext* context) 
@@ -577,7 +719,7 @@ void exec_expression(struct ExecutionContext* context)
         }
         else if (current == '[')
         {
-            
+            exec_function(context);
         }
         else 
         {
