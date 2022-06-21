@@ -507,6 +507,10 @@ void exec_call_cleanup(struct ExecutionContext* context, int start_stack_index, 
 
 void exec_call_native_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
 {
+#ifdef TOKEN_DEBUG
+    printf("Calling function at address: %p", stack_value.value);
+#endif
+
     if (stack_value.type != STACK_TYPE_NATIVE_FUNCTION)
     {
         printf("ERR!: Value is not a function\n");
@@ -535,6 +539,10 @@ void exec_call_native_function(struct ExecutionContextStackValue stack_value, st
 
 void exec_call_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
 {
+#ifdef TOKEN_DEBUG
+    printf("Calling function at position: %d", stack_value.value);
+#endif
+
     if (stack_value.type != STACK_TYPE_FUNCTION)
     {
         printf("ERR!: Value is not a function\n");
