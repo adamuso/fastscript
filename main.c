@@ -10,7 +10,10 @@
 enum {
     STACK_TYPE_INTEGER,
     STACK_TYPE_NATIVE_FUNCTION,
-    STACK_TYPE_FUNCTION
+    STACK_TYPE_FUNCTION,
+
+    // 8th bit is specifying if variable has dynamic type
+    STACK_TYPE_DYNAMIC = 0x80
 };
 
 #ifdef TOKEN_DEBUG
@@ -28,15 +31,16 @@ void exec(const char* code);
 int main() 
 {
     exec("\
-        a = 2; \
+        var a = 2; \
         print(a); \
         a = add(a, 10); \
         print(a); \
-        b = [](x) => { \
+        var b = [](var x) => { \
             x = add(x, 5); \
             print(x); \
         }; \
         b(a); \
+        i32 c = b; \
     ");
     return 0;
 }
@@ -101,6 +105,12 @@ struct ExecutionContextScope* context_push_scope(struct ExecutionContext* contex
     return context_get_scope(context);
 }
 
+struct ExecutionContextScope* context_pop_scope(struct ExecutionContext* context)
+{
+    context->scope_index--;
+    return context_get_scope(context);
+}
+
 int context_eof(struct ExecutionContext* context)
 {
     return context->position >= context->code_len;    
@@ -116,6 +126,23 @@ void context_skip_spaces(struct ExecutionContext* context)
         ++current; 
         context->position++;
     };
+}
+
+uint8_t context_get_type_from_identifier(struct ExecutionContext* context, const char* identifier, int identifier_length) 
+{
+    uint8_t declaration_type = 255;
+
+    if (identifier_length == 3 && strncmp(identifier, "var", 3) == 0)
+    {
+        // 8th bit is specifying if variable has dynamic type
+        declaration_type = STACK_TYPE_DYNAMIC;
+    }
+    else if (identifier_length == 3 && strncmp(identifier, "i32", 3) == 0)
+    {
+        declaration_type = STACK_TYPE_INTEGER;
+    }
+
+    return declaration_type;
 }
 
 int context_scope_variables_binary_search(struct ExecutionContextScope* scope, int l, int r, const char* x)
@@ -208,31 +235,51 @@ struct ExecutionContextStackValue context_stack_get_value_at_index(struct Execut
     return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index] };
 }
 
-struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionContextScope* scope, const char* name)
+struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionContextScope* scope, const char* name, uint8_t declaration_type)
 {
     int index = scope->variable_count++;
     strncpy(scope->variables[index].name, name, MAX_IDENTIFIER_LENGTH);
     scope->variables[index].value = 0;
-    scope->variables[index].type = 0;
+    scope->variables[index].type = declaration_type;
 
     #ifdef TOKEN_DEBUG
-        printf("Adding variable '%s' (index: %d) to scope.\n", name, index);
+        printf("Adding variable '%s' (index: %d, type: %s) to scope.\n", name, index, stack_type_names[declaration_type]);
     #endif
 
     return (struct ExecutionContextVariableInfo) { .index = index, .variable = &scope->variables[index] };
 }
 
-void context_set_variable(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, uint64_t value, uint8_t type)
+void context_set_variable_(struct ExecutionContext* context, struct ExecutionContextVariable* info, uint64_t value, uint8_t type)
 {
-    info.variable->value = value;
-    info.variable->type = type;
+    if (!(info->type & STACK_TYPE_DYNAMIC))
+    {
+        if (info->type != type)
+        {
+            printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", stack_type_names[info->type], stack_type_names[type]);
+            return;
+        }
+    }
+
+    info->value = value;
+    info->type = type;
 }
 
+void context_set_variable(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, uint64_t value, uint8_t type)
+{
+    context_set_variable_(context, info.variable, value, type);
+}
 
 void context_set_variable_ptr(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, void* ptr, uint8_t type)
 {
     info.variable->value = (uint64_t)ptr;
     info.variable->type = type;
+}
+
+struct ExecutionContextVariableInfo context_add_variable(struct ExecutionContext* context, const char* name, uint8_t declaration_type)
+{
+    struct ExecutionContextScope* local_scope = context_get_scope(context);
+
+    return context_scope_add_variable(local_scope, name, declaration_type);
 }
 
 struct ExecutionContextVariableInfo context_lookup_variable(struct ExecutionContext* context, const char* name)
@@ -259,7 +306,7 @@ struct ExecutionContextVariableInfo context_lookup_variable(struct ExecutionCont
             printf("Variable named '%s' does not exists in scope.\n", name);
         #endif
     
-        return context_scope_add_variable(local_scope, name);
+        return (struct ExecutionContextVariableInfo) { .index = -1, .variable = NULL };
     }
 
     #ifdef TOKEN_DEBUG
@@ -497,9 +544,33 @@ void exec_function(struct ExecutionContext* context)
 struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* context)
 {
     char identifier[MAX_IDENTIFIER_LENGTH];
-    parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+    int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+
+    uint8_t declaration_type = context_get_type_from_identifier(context, identifier, identifier_length);
     
+    context_skip_spaces(context);
+
+    if (declaration_type != 255)
+    {
+        parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+    }
+
     struct ExecutionContextVariableInfo variable = context_lookup_variable(context, identifier);
+    
+#ifdef TOKEN_DEBUG
+    printf("Lookup variable '%s' (index: %d, type: %d)\n", identifier, variable.index, declaration_type);
+#endif
+
+    if (variable.index == -1 && declaration_type != 255)
+    {
+        variable = context_add_variable(context, identifier, declaration_type);
+    }
+
+    if (variable.index == -1)
+    {
+        printf("ERR!: Variable %s is not defined.\n", identifier);
+        return variable;
+    }
 
 #ifdef TOKEN_DEBUG
     printf("Push variable '%s' (index: %d) to stack\n", identifier, variable.index);
@@ -518,9 +589,8 @@ void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVa
     printf("Assign value '[%s] %d' to '%s'\n", stack_type_names[value.type], context->stack[context->stack_index - 1], variable->name);
 #endif
 
-    variable->value = value.value;
-    variable->type = value.type;
-
+    context_set_variable_(context, variable, value.value, value.type);
+    
     context_pop_stack(context);
 }
 
@@ -645,12 +715,19 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
             struct ExecutionContextStackValue arg_stack_value = context_stack_get_value_at_index(context, start_stack_index + index);
             index++;
 
+            char type_identifier[MAX_IDENTIFIER_LENGTH];
+            context_skip_spaces(context);
+            int type_identifier_length = parse_identifier(context, type_identifier, MAX_IDENTIFIER_LENGTH);
+            context_skip_spaces(context);
+
+            uint8_t type = context_get_type_from_identifier(context, type_identifier, type_identifier_length);
+
             char identifier[MAX_IDENTIFIER_LENGTH];
             context_skip_spaces(context);
             parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
             context_skip_spaces(context);
 
-            struct ExecutionContextVariableInfo info =  context_scope_add_variable(scope, identifier);
+            struct ExecutionContextVariableInfo info =  context_scope_add_variable(scope, identifier, type);
             context_set_variable(context, info, arg_stack_value.value, arg_stack_value.type);
             current = context->code[context->position];
         }
@@ -693,6 +770,7 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
     context->position = return_position;
     
     exec_call_cleanup(context, start_stack_index, args_count);
+    context_pop_scope(context);
 }
 
 void exec_call(struct ExecutionContext* context) 
@@ -736,6 +814,12 @@ void exec_expression(struct ExecutionContext* context)
         if (isalpha(current)) 
         {
             last_identifier = exec_identifier(context);
+
+            if (last_identifier.index == -1) 
+            {
+                continue;
+            }
+
             last_expression = 1;
             last_identifier.index = -1;
             continue;
@@ -862,6 +946,8 @@ void exec_block(struct ExecutionContext* context)
     #endif
 }
 
+#pragma region --- SCRIPT FUNCTIONS ---
+
 void fts_print(struct ExecutionContext* context)
 {
     struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
@@ -886,6 +972,8 @@ void fts_add(struct ExecutionContext* context)
     }
 }
 
+#pragma endregion --- SCRIPT FUNCTIONS ---
+
 void exec(const char* code)
 {
     struct ExecutionContext context;
@@ -898,8 +986,8 @@ void exec(const char* code)
     context.global_scope.variable_count = 0;
     context_scope_init(&context);
 
-    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "print"), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
-    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "add"), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "print", STACK_TYPE_NATIVE_FUNCTION), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "add", STACK_TYPE_NATIVE_FUNCTION), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
 
     exec_block(&context);
 }
