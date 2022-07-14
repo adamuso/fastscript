@@ -7,21 +7,57 @@
 #define TEST_DEBUG
 #define TOKEN_DEBUG
 
-enum {
+enum 
+{
+    STACK_TYPE_ACQUIRE,
     STACK_TYPE_INTEGER,
     STACK_TYPE_NATIVE_FUNCTION,
     STACK_TYPE_FUNCTION,
+    STACK_TYPE_STRUCT,
+
+    NATIVE_TYPE_I8,
+    NATIVE_TYPE_I16,
+    NATIVE_TYPE_I32,
+    NATIVE_TYPE_I64,
+
+    NATIVE_TYPE_U8,
+    NATIVE_TYPE_U16,
+    NATIVE_TYPE_U32,
+    NATIVE_TYPE_U64,
+    
+    NATIVE_TYPE_FLOAT,
+    NATIVE_TYPE_DOUBLE,
+    NATIVE_TYPE_PTR,
+    NATIVE_TYPE_STRING,
+
+    NATIVE_TYPE_NATIVE_FUNCTION,
+    NATIVE_TYPE_FUNCTION,
 
     // 8th bit is specifying if variable has dynamic type
     STACK_TYPE_DYNAMIC = 0x80
 };
 
 #ifdef TOKEN_DEBUG
-const char* stack_type_names[3] = {
+const char* stack_type_names[5] = 
+{
+    "unknown",
     "integer",
     "native_function",
-    "function"
+    "function",
+    "struct"
 };
+
+const char* get_stack_type_name(int type)
+{
+    type = type & 0x7f;
+
+    if (type < 0 || type >= 4) 
+    {
+        return "invalid_type";
+    }
+
+    return stack_type_names[type];
+}
 #endif
 
 #define MAX_IDENTIFIER_LENGTH 32
@@ -31,6 +67,32 @@ void exec(const char* code);
 int main() 
 {
     exec("\
+        let X = struct { \
+            i32 test; \
+        }; \
+        \
+        var a = 2; \
+        print(a); \
+        a = add(a, 10); \
+        print(a); \
+        var b = [](var x) => { \
+            x = add(x, 5); \
+            print(x); \
+        }; \
+        b(a); \
+        i32 c = b; \
+    ");
+
+    // exec("\
+        struct X { \
+            i32 test; \
+            u8 abc; \
+        } \
+        X v = X { test: 10, abc: 3 }; \
+        print(add(v.test, v.abc)); \
+        let zero_test = [](X x) => { x.test = 0; }; \
+        v.zero_test() \
+        \
         var a = 2; \
         print(a); \
         a = add(a, 10); \
@@ -45,7 +107,20 @@ int main()
     return 0;
 }
 
+struct ExecutionContextStructFieldDefinition
+{
+    char name[MAX_IDENTIFIER_LENGTH];
+    uint8_t flags; // optional?
+    uint8_t type;
+};
 
+struct ExecutionContextStructDefinition
+{
+    struct ExecutionContextStructFieldDefinition fields[8];
+    uint8_t flags; // treat as tuple
+    int field_count;
+    int size;
+};
 
 
 #pragma region --- CONTEXT ---
@@ -136,6 +211,10 @@ uint8_t context_get_type_from_identifier(struct ExecutionContext* context, const
     {
         // 8th bit is specifying if variable has dynamic type
         declaration_type = STACK_TYPE_DYNAMIC;
+    }
+    else if (identifier_length == 3 && strncmp(identifier, "let", 3) == 0)
+    {
+        declaration_type = STACK_TYPE_ACQUIRE;
     }
     else if (identifier_length == 3 && strncmp(identifier, "i32", 3) == 0)
     {
@@ -243,7 +322,7 @@ struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionC
     scope->variables[index].type = declaration_type;
 
     #ifdef TOKEN_DEBUG
-        printf("Adding variable '%s' (index: %d, type: %s) to scope.\n", name, index, stack_type_names[declaration_type]);
+        printf("Adding variable '%s' (index: %d, type: %s) to scope.\n", name, index, get_stack_type_name(declaration_type));
     #endif
 
     return (struct ExecutionContextVariableInfo) { .index = index, .variable = &scope->variables[index] };
@@ -251,11 +330,11 @@ struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionC
 
 void context_set_variable_(struct ExecutionContext* context, struct ExecutionContextVariable* info, uint64_t value, uint8_t type)
 {
-    if (!(info->type & STACK_TYPE_DYNAMIC))
+    if (!(info->type & STACK_TYPE_DYNAMIC) && !(info->type == STACK_TYPE_ACQUIRE))
     {
         if (info->type != type)
         {
-            printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", stack_type_names[info->type], stack_type_names[type]);
+            printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(info->type), get_stack_type_name(type));
             return;
         }
     }
@@ -541,18 +620,18 @@ void exec_function(struct ExecutionContext* context)
     context_push_stack(context, code_start, STACK_TYPE_FUNCTION);
 }
 
-struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* context)
+struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* context, const char* identifier, int identifier_length)
 {
-    char identifier[MAX_IDENTIFIER_LENGTH];
-    int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
-
     uint8_t declaration_type = context_get_type_from_identifier(context, identifier, identifier_length);
     
     context_skip_spaces(context);
 
+    char next_identifier[MAX_IDENTIFIER_LENGTH];
+
     if (declaration_type != 255)
     {
-        parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+        identifier_length = parse_identifier(context, next_identifier, MAX_IDENTIFIER_LENGTH);
+        identifier = next_identifier;
     }
 
     struct ExecutionContextVariableInfo variable = context_lookup_variable(context, identifier);
@@ -586,7 +665,7 @@ void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVa
 
 #ifdef TOKEN_DEBUG
     // printf("Assign value '%d' to %p\n", context->stack[context->stack_index - 1], (uint64_t*)context->stack[context->stack_index - 2]);
-    printf("Assign value '[%s] %d' to '%s'\n", stack_type_names[value.type], context->stack[context->stack_index - 1], variable->name);
+    printf("Assign value '[%s] %d' to '%s'\n", get_stack_type_name(value.type), context->stack[context->stack_index - 1], variable->name);
 #endif
 
     context_set_variable_(context, variable, value.value, value.type);
@@ -791,6 +870,94 @@ void exec_call(struct ExecutionContext* context)
     }
 }
 
+void exec_struct(struct ExecutionContext* context)
+{
+    context_skip_spaces(context);
+
+    char current = context->code[context->position];
+
+    if (current != '{')
+    {
+        char identifier[MAX_IDENTIFIER_LENGTH];
+        int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+    }
+
+    context_skip_spaces(context);
+    current = context->code[context->position];
+
+    struct ExecutionContextStructDefinition* definition = malloc(sizeof(struct ExecutionContextStructDefinition));
+
+    if (current != '{')
+    {
+        printf("ERR!: Epected '{'\n");
+        return;
+    }
+
+    context->position++;
+    current = context->code[context->position];
+
+    if (current != '}')
+    {
+        // Args on the stack needs to be assinged to scope variables
+        int index = 0;
+
+        do
+        {
+            if (current == ';')
+            {
+                context->position++;
+                context_skip_spaces(context);
+                current = context->code[context->position];
+            }
+
+            if (current == '}')
+            {
+                break;
+            }
+
+            char type_identifier[MAX_IDENTIFIER_LENGTH];
+            context_skip_spaces(context);
+            int type_identifier_length = parse_identifier(context, type_identifier, MAX_IDENTIFIER_LENGTH);
+            context_skip_spaces(context);
+
+            uint8_t type = context_get_type_from_identifier(context, type_identifier, type_identifier_length);
+
+            char identifier[MAX_IDENTIFIER_LENGTH];
+            context_skip_spaces(context);
+            parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+            context_skip_spaces(context);
+
+            strncpy(definition->fields[index].name, identifier, MAX_IDENTIFIER_LENGTH);
+            definition->fields[index].flags = 0;
+            definition->fields[index].type = type;
+            index++;
+
+            context_skip_spaces(context);
+            current = context->code[context->position];
+        }
+        while (current == ';');
+
+        definition->field_count = index;
+
+        if (current == '}')
+        {
+            context->position++;
+        }
+        else 
+        {
+            printf("ERR!: Syntax error missing ')'\n");
+            // FIXME: should panic
+            return;
+        }
+    }
+    else 
+    {
+        context->position++;
+    }
+
+    context_push_stack(context, (uint64_t)definition, STACK_TYPE_STRUCT);
+}
+
 void exec_expression(struct ExecutionContext* context)
 {
     char current;
@@ -813,7 +980,16 @@ void exec_expression(struct ExecutionContext* context)
 
         if (isalpha(current)) 
         {
-            last_identifier = exec_identifier(context);
+            char identifier[MAX_IDENTIFIER_LENGTH];
+            int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+
+            if (identifier_length == 6 && strncmp(identifier, "struct", identifier_length) == 0)
+            {
+                exec_struct(context);
+                continue;
+            }
+
+            last_identifier = exec_identifier(context, identifier, identifier_length);
 
             if (last_identifier.index == -1) 
             {
