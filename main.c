@@ -14,6 +14,7 @@ enum
     STACK_TYPE_NATIVE_FUNCTION,
     STACK_TYPE_FUNCTION,
     STACK_TYPE_STRUCT,
+    STACK_TYPE_OBJECT,
 
     NATIVE_TYPE_I8,
     NATIVE_TYPE_I16,
@@ -44,7 +45,8 @@ const char* stack_type_names[5] =
     "integer",
     "native_function",
     "function",
-    "struct"
+    "struct",
+    "object"
 };
 
 const char* get_stack_type_name(int type)
@@ -60,9 +62,68 @@ const char* get_stack_type_name(int type)
 }
 #endif
 
+struct ref {
+    void (*free)(const void* object);
+    int count;
+};
+
+void* object_create(size_t type_size)
+{
+    void* object = malloc(type_size + sizeof(struct ref));
+    struct ref* object_ref = (struct ref*)(object);
+
+    object_ref->count = 0;
+    object_ref->free = 0;
+
+    return ((uint8_t*)object) + sizeof(struct ref);
+}
+
+void* object_ref(void* object)
+{
+    struct ref* object_ref = ((uint8_t*)object) - sizeof(struct ref);
+
+    ++object_ref->count;
+
+    return object_ref;
+}
+
+void object_deref(void* object)
+{
+    struct ref* object_ref = ((uint8_t*)object) - sizeof(struct ref);
+
+    if (--object_ref->count == 0)
+    {
+        if (object_ref->free)
+        {
+            object_ref->free(object_ref);
+        }
+
+        free(object);
+    }
+}
+
 #define MAX_IDENTIFIER_LENGTH 32
 
 void exec(const char* code);
+
+// Stack holds values with the size of native pointer, for 64 bit architectures: 8 bytes
+// All native types should have a size that fits in a stack value
+//
+// Block: 
+//   Starts with '{' and ends with '}', consists of one or more statements
+// 
+// Statement:
+//   Ends with a semicolon ';'. Consists of an expression or variable declaration.   
+//   After all statements stack should be cleared, but not after variable declarations
+//
+// Variable declaration:
+//   Starts with: 'let', 'const', 'var' or type name.
+//   Declaration types:
+//   - let - declares a mutable variable which have static type that is acquired from the assignment
+//   - const - declares a non mutable variable which have a static type that is acquired from the assignment
+//   - var - declares a mutable variable which have dynamic type
+//   - <type name> - declares a mutable variable which have explictly defined type
+//
 
 int main() 
 {
@@ -339,6 +400,16 @@ void context_set_variable_(struct ExecutionContext* context, struct ExecutionCon
         }
     }
 
+    if (info->type == STACK_TYPE_STRUCT || info->type == STACK_TYPE_OBJECT)
+    {
+        object_deref((void*)info->value);
+    }
+
+    if (type == STACK_TYPE_STRUCT || type == STACK_TYPE_OBJECT)
+    {
+        object_ref((void*)value);
+    }
+
     info->value = value;
     info->type = type;
 }
@@ -350,8 +421,7 @@ void context_set_variable(struct ExecutionContext* context, struct ExecutionCont
 
 void context_set_variable_ptr(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, void* ptr, uint8_t type)
 {
-    info.variable->value = (uint64_t)ptr;
-    info.variable->type = type;
+    context_set_variable_(context, info.variable, (uint64_t)ptr, type);
 }
 
 struct ExecutionContextVariableInfo context_add_variable(struct ExecutionContext* context, const char* name, uint8_t declaration_type)
@@ -806,7 +876,7 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
             parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
             context_skip_spaces(context);
 
-            struct ExecutionContextVariableInfo info =  context_scope_add_variable(scope, identifier, type);
+            struct ExecutionContextVariableInfo info = context_scope_add_variable(scope, identifier, type);
             context_set_variable(context, info, arg_stack_value.value, arg_stack_value.type);
             current = context->code[context->position];
         }
@@ -885,7 +955,7 @@ void exec_struct(struct ExecutionContext* context)
     context_skip_spaces(context);
     current = context->code[context->position];
 
-    struct ExecutionContextStructDefinition* definition = malloc(sizeof(struct ExecutionContextStructDefinition));
+    struct ExecutionContextStructDefinition* definition = object_create(sizeof(struct ExecutionContextStructDefinition));
 
     if (current != '{')
     {
