@@ -15,6 +15,8 @@ enum
     STACK_TYPE_FUNCTION,
     STACK_TYPE_STRUCT,
     STACK_TYPE_OBJECT,
+    STACK_TYPE_STRUCT_START,
+    STACK_TYPE_STRUCT_END,
 
     NATIVE_TYPE_I8,
     NATIVE_TYPE_I16,
@@ -39,7 +41,7 @@ enum
 };
 
 #ifdef TOKEN_DEBUG
-const char* stack_type_names[5] = 
+const char* stack_type_names[6] = 
 {
     "unknown",
     "integer",
@@ -53,7 +55,7 @@ const char* get_stack_type_name(int type)
 {
     type = type & 0x7f;
 
-    if (type < 0 || type >= 4) 
+    if (type < 0 || type >= 6) 
     {
         return "invalid_type";
     }
@@ -80,7 +82,7 @@ void* object_create(size_t type_size)
 
 void* object_ref(void* object)
 {
-    struct ref* object_ref = ((uint8_t*)object) - sizeof(struct ref);
+    struct ref* object_ref = (void*)(((uint8_t*)object) - sizeof(struct ref));
 
     ++object_ref->count;
 
@@ -89,7 +91,7 @@ void* object_ref(void* object)
 
 void object_deref(void* object)
 {
-    struct ref* object_ref = ((uint8_t*)object) - sizeof(struct ref);
+    struct ref* object_ref = (void*)(((uint8_t*)object) - sizeof(struct ref));
 
     if (--object_ref->count == 0)
     {
@@ -188,8 +190,7 @@ struct ExecutionContextStructDefinition
 struct ExecutionContextVariable
 {
     char name[MAX_IDENTIFIER_LENGTH];
-    uint64_t value;
-    uint8_t type;
+    int stack_index;
 };
 
 struct ExecutionContextScope
@@ -202,6 +203,7 @@ struct ExecutionContextStackValue
 {
     uint64_t value;
     uint8_t type;
+    int size;
 };
 
 struct ExecutionContext
@@ -212,9 +214,10 @@ struct ExecutionContext
     struct ExecutionContextScope global_scope;
     struct ExecutionContextScope scopes[16];
     int scope_index;
-    uint64_t stack[32];
-    uint8_t stack_type[32];
+    uint64_t stack[64];
+    uint8_t stack_type[64];
     int stack_index;
+    int stack_variables;
 };
 
 struct ExecutionContextVariableInfo
@@ -222,30 +225,6 @@ struct ExecutionContextVariableInfo
     int index;
     struct ExecutionContextVariable* variable;
 };
-
-
-void context_scope_init(struct ExecutionContext* context)
-{
-    context->scopes[context->scope_index].variable_count = 0;
-}
-
-struct ExecutionContextScope* context_get_scope(struct ExecutionContext* context)
-{
-    return &context->scopes[context->scope_index];
-}
-
-struct ExecutionContextScope* context_push_scope(struct ExecutionContext* context)
-{
-    context->scope_index++;
-    context_scope_init(context);
-    return context_get_scope(context);
-}
-
-struct ExecutionContextScope* context_pop_scope(struct ExecutionContext* context)
-{
-    context->scope_index--;
-    return context_get_scope(context);
-}
 
 int context_eof(struct ExecutionContext* context)
 {
@@ -283,6 +262,127 @@ uint8_t context_get_type_from_identifier(struct ExecutionContext* context, const
     }
 
     return declaration_type;
+}
+
+#pragma region --- CONTEXT STACK ---
+
+int context_push_stack(struct ExecutionContext* context, uint64_t value, uint8_t type)
+{
+    int index = context->stack_index++;
+    context->stack[index] = value;
+    context->stack_type[index] = type;
+
+    #ifdef TOKEN_DEBUG
+        int start_stack_index = context->stack_index;
+        printf("Pushed to stack (count: %d, value: %d, value_ptr: %p, type: %d)\n", context->stack_index, context->stack[index], context->stack[index], context->stack_type[index]);
+    #endif
+
+    return index;
+}
+
+int context_pop_stack(struct ExecutionContext* context)
+{
+    if (context->stack_index == 0) 
+    {
+        printf("ERR!: Stack underflow\n");
+        return 0;
+    }
+
+    context->stack_index--;
+
+    #ifdef TOKEN_DEBUG
+        int start_stack_index = context->stack_index;
+        printf("Popped from stack (count: %d)\n", context->stack_index);
+    #endif
+
+    return context->stack_index;
+}
+
+void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
+{
+    uint64_t current_value = context->stack[index];
+    uint8_t current_type = context->stack_type[index];
+
+    if (!(current_type & STACK_TYPE_DYNAMIC) && !(current_type == STACK_TYPE_ACQUIRE))
+    {
+        if (current_type != value.type)
+        {
+            printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(current_type), get_stack_type_name(value.type));
+            return;
+        }
+    }
+
+    if (current_type == STACK_TYPE_STRUCT || current_type == STACK_TYPE_OBJECT)
+    {
+        object_deref((void*)current_value);
+    }
+
+    if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_OBJECT)
+    {
+        object_ref((void*)value.value);
+    }
+
+    context->stack[index] = value.value;
+    context->stack_type[index] = value.type;
+}
+
+struct ExecutionContextStackValue context_stack_get_value_at_index(struct ExecutionContext* context, int index)
+{
+    int len = 1;
+
+    if (context->stack_type[index] == STACK_TYPE_STRUCT_START)
+    {
+        int len_index = index + 1;
+
+        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_END)
+        {
+            ++len_index;
+        }     
+
+        len = len_index - index;  
+    }
+
+    if (context->stack_type[index] == STACK_TYPE_STRUCT_END)
+    {
+        int len_index = index - 1;
+
+        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_START)
+        {
+            --len_index;
+        }     
+
+        len = index - len_index;
+        index = len_index;  
+    }
+
+    return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index], .size = len };
+}
+
+#pragma endregion --- CONTEXT STACK ---
+
+#pragma region --- CONTEXT SCOPE ---
+
+void context_scope_init(struct ExecutionContext* context)
+{
+    context->scopes[context->scope_index].variable_count = 0;
+}
+
+struct ExecutionContextScope* context_get_scope(struct ExecutionContext* context)
+{
+    return &context->scopes[context->scope_index];
+}
+
+struct ExecutionContextScope* context_push_scope(struct ExecutionContext* context)
+{
+    context->scope_index++;
+    context_scope_init(context);
+    return context_get_scope(context);
+}
+
+struct ExecutionContextScope* context_pop_scope(struct ExecutionContext* context)
+{
+    context->scope_index--;
+    return context_get_scope(context);
 }
 
 int context_scope_variables_binary_search(struct ExecutionContextScope* scope, int l, int r, const char* x)
@@ -332,86 +432,24 @@ int context_scope_variables_linear_search(struct ExecutionContextScope* scope, c
     return -1;
 }
 
-int context_push_stack(struct ExecutionContext* context, uint64_t value, uint8_t type)
-{
-    int index = context->stack_index++;
-    context->stack[index] = value;
-    context->stack_type[index] = type;
-
-    #ifdef TOKEN_DEBUG
-        int start_stack_index = context->stack_index;
-        printf("Pushed to stack (count: %d, value: %d, value_ptr: %p, type: %d)\n", context->stack_index, context->stack[index], context->stack[index], context->stack_type[index]);
-    #endif
-
-    return index;
-}
-
-int context_pop_stack(struct ExecutionContext* context)
-{
-    if (context->stack_index == 0) 
-    {
-        printf("ERR!: Stack underflow\n");
-        return 0;
-    }
-
-    context->stack_index--;
-
-    #ifdef TOKEN_DEBUG
-        int start_stack_index = context->stack_index;
-        printf("Popped from stack (count: %d)\n", context->stack_index);
-    #endif
-
-    return context->stack_index;
-}
-
-void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
-{
-    context->stack[index] = value.value;
-    context->stack_type[index] = value.type;
-}
-
-struct ExecutionContextStackValue context_stack_get_value_at_index(struct ExecutionContext* context, int index)
-{
-    return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index] };
-}
-
-struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionContextScope* scope, const char* name, uint8_t declaration_type)
+struct ExecutionContextVariableInfo context_scope_add_variable(struct ExecutionContextScope* scope, const char* name, int stack_index) 
 {
     int index = scope->variable_count++;
     strncpy(scope->variables[index].name, name, MAX_IDENTIFIER_LENGTH);
-    scope->variables[index].value = 0;
-    scope->variables[index].type = declaration_type;
+    scope->variables[index].stack_index = stack_index;
 
     #ifdef TOKEN_DEBUG
-        printf("Adding variable '%s' (index: %d, type: %s) to scope.\n", name, index, get_stack_type_name(declaration_type));
+        printf("Adding variable '%s' (stack index: %d) to scope.\n", name, stack_index);
     #endif
 
     return (struct ExecutionContextVariableInfo) { .index = index, .variable = &scope->variables[index] };
 }
 
+#pragma endregion --- CONTEXT SCOPE ---
+
 void context_set_variable_(struct ExecutionContext* context, struct ExecutionContextVariable* info, uint64_t value, uint8_t type)
 {
-    if (!(info->type & STACK_TYPE_DYNAMIC) && !(info->type == STACK_TYPE_ACQUIRE))
-    {
-        if (info->type != type)
-        {
-            printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(info->type), get_stack_type_name(type));
-            return;
-        }
-    }
-
-    if (info->type == STACK_TYPE_STRUCT || info->type == STACK_TYPE_OBJECT)
-    {
-        object_deref((void*)info->value);
-    }
-
-    if (type == STACK_TYPE_STRUCT || type == STACK_TYPE_OBJECT)
-    {
-        object_ref((void*)value);
-    }
-
-    info->value = value;
-    info->type = type;
+    context_stack_set_value_at_index(context, info->stack_index, (struct ExecutionContextStackValue) { .value = value, .type = type });
 }
 
 void context_set_variable(struct ExecutionContext* context, struct ExecutionContextVariableInfo info, uint64_t value, uint8_t type)
@@ -424,11 +462,48 @@ void context_set_variable_ptr(struct ExecutionContext* context, struct Execution
     context_set_variable_(context, info.variable, (uint64_t)ptr, type);
 }
 
-struct ExecutionContextVariableInfo context_add_variable(struct ExecutionContext* context, const char* name, uint8_t declaration_type)
+struct ExecutionContextStackValue context_get_variable(struct ExecutionContext* context, struct ExecutionContextVariableInfo info)
 {
-    struct ExecutionContextScope* local_scope = context_get_scope(context);
+    return context_stack_get_value_at_index(context, info.variable->stack_index);
+}
 
-    return context_scope_add_variable(local_scope, name, declaration_type);
+void context_push_variable_into_stack(struct ExecutionContext* context, struct ExecutionContextVariableInfo info)
+{
+    struct ExecutionContextStackValue value = context_get_variable(context, info);
+    context_push_stack(context, value.value, value.type);
+}
+
+struct ExecutionContextVariableInfo context_add_variable(struct ExecutionContext* context, struct ExecutionContextScope* scope, const char* name, uint8_t declaration_type, size_t size_in_bytes, int override)
+{
+    if (size_in_bytes == 0)
+    {
+        printf("ERR!: Tried to add variable %s with size 0.\n", name);
+        return (struct ExecutionContextVariableInfo) { .index = -1, .variable = NULL };
+    }
+
+    int stack_index = context->stack_index;
+
+    if (!override)
+    {
+        context->stack[stack_index] = 0;
+    }
+
+    context->stack_type[stack_index] = declaration_type;
+
+    context->stack_index += (size_in_bytes - 1) / 8 + 1;
+    ++context->stack_variables;
+
+    return context_scope_add_variable(scope, name, stack_index);
+}
+
+struct ExecutionContextVariableInfo context_add_local_variable(struct ExecutionContext* context, const char* name, uint8_t declaration_type, size_t size_in_bytes)
+{
+    return context_add_variable(context, context_get_scope(context), name, declaration_type, size_in_bytes, 0);
+}
+
+struct ExecutionContextVariableInfo context_add_global_variable(struct ExecutionContext* context, const char* name, uint8_t declaration_type, size_t size_in_bytes)
+{
+    return context_add_variable(context, &context->global_scope, name, declaration_type, size_in_bytes, 0);
 }
 
 struct ExecutionContextVariableInfo context_lookup_variable(struct ExecutionContext* context, const char* name)
@@ -690,6 +765,64 @@ void exec_function(struct ExecutionContext* context)
     context_push_stack(context, code_start, STACK_TYPE_FUNCTION);
 }
 
+void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVariable* variable) 
+{
+    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+
+#ifdef TOKEN_DEBUG
+    // printf("Assign value '%d' to %p\n", context->stack[context->stack_index - 1], (uint64_t*)context->stack[context->stack_index - 2]);
+    printf("Assign value '[%s] %d' to '%s'\n", get_stack_type_name(value.type), context->stack[context->stack_index - 1], variable->name);
+#endif
+
+    context_set_variable_(context, variable, value.value, value.type);
+    
+    context_pop_stack(context);
+}
+
+void exec_variable_declaration(struct ExecutionContext* context, const char* identifier, uint8_t declaration_type)
+{
+    context_skip_spaces(context);
+
+    char current = context->code[context->position];
+
+    if (current != '=')
+    {
+        printf("ERR!: Expected '=' for '%s' variable declaration.\n", identifier);
+    }
+    else 
+    {
+        context->position++;
+    }
+
+    exec_expression(context);
+
+    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+
+    context->stack_index -= value.size;
+
+    struct ExecutionContextVariableInfo info = context_add_variable(
+        context, 
+        context_get_scope(context), 
+        identifier, 
+        declaration_type, 
+        value.size * 8,
+        1
+    );
+
+    if (!info.variable)
+    {
+        printf("ERR!: Cannot add local variable '%s'.\n", identifier);
+        return;
+    }
+
+    context_set_variable_(context, info.variable, value.value, value.type);
+
+#ifdef TOKEN_DEBUG
+    printf("Declared variable '%s' with value '[%s] %d'\n", info.variable->name, get_stack_type_name(value.type), context->stack[context->stack_index - 1]);
+#endif
+
+}
+
 struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* context, const char* identifier, int identifier_length)
 {
     uint8_t declaration_type = context_get_type_from_identifier(context, identifier, identifier_length);
@@ -712,7 +845,8 @@ struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* con
 
     if (variable.index == -1 && declaration_type != 255)
     {
-        variable = context_add_variable(context, identifier, declaration_type);
+        exec_variable_declaration(context, identifier, declaration_type);
+        return (struct ExecutionContextVariableInfo) { .index = -1, .variable = NULL };
     }
 
     if (variable.index == -1)
@@ -725,22 +859,8 @@ struct ExecutionContextVariableInfo exec_identifier(struct ExecutionContext* con
     printf("Push variable '%s' (index: %d) to stack\n", identifier, variable.index);
 #endif
     
-    context_push_stack(context, variable.variable->value, variable.variable->type);
+    context_push_variable_into_stack(context, variable);
     return variable;
-}
-
-void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVariable* variable) 
-{
-    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
-
-#ifdef TOKEN_DEBUG
-    // printf("Assign value '%d' to %p\n", context->stack[context->stack_index - 1], (uint64_t*)context->stack[context->stack_index - 2]);
-    printf("Assign value '[%s] %d' to '%s'\n", get_stack_type_name(value.type), context->stack[context->stack_index - 1], variable->name);
-#endif
-
-    context_set_variable_(context, variable, value.value, value.type);
-    
-    context_pop_stack(context);
 }
 
 int exec_call_args(struct ExecutionContext* context, int start_stack_index) 
@@ -876,7 +996,7 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
             parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
             context_skip_spaces(context);
 
-            struct ExecutionContextVariableInfo info = context_scope_add_variable(scope, identifier, type);
+            struct ExecutionContextVariableInfo info = context_add_local_variable(context, identifier, type, 1);
             context_set_variable(context, info, arg_stack_value.value, arg_stack_value.type);
             current = context->code[context->position];
         }
@@ -1149,6 +1269,9 @@ void exec_block(struct ExecutionContext* context)
         printf("Parsing block\n");
     #endif
 
+    int block_stack_index = context->stack_index;
+    int block_stack_variables = context->stack_variables;
+
     while (context->position < context->code_len)
     {
         int stack_index = context->stack_index;
@@ -1178,7 +1301,7 @@ void exec_block(struct ExecutionContext* context)
             printf("--- End parsing statement (stack_index: %d) ---\n", context->stack_index);
         #endif
 
-        context->stack_index = stack_index;
+        context->stack_index = stack_index >= context->stack_variables ? stack_index : context->stack_variables;
 
         if (current == '}')
         {
@@ -1186,6 +1309,9 @@ void exec_block(struct ExecutionContext* context)
             break;
         }
     }
+
+    context->stack_index = block_stack_index;
+    context->stack_variables = block_stack_variables;
 
     #ifdef TOKEN_DEBUG
         printf("End parsing block\n");
@@ -1228,12 +1354,13 @@ void exec(const char* code)
     context.scope_index = 0;
     context.position = 0;
     context.stack_index = 0;
+    context.stack_variables = 0;
 
     context.global_scope.variable_count = 0;
     context_scope_init(&context);
 
-    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "print", STACK_TYPE_NATIVE_FUNCTION), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
-    context_set_variable_ptr(&context, context_scope_add_variable(&context.global_scope, "add", STACK_TYPE_NATIVE_FUNCTION), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_add_global_variable(&context, "print", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_add_global_variable(&context, "add", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
 
     exec_block(&context);
 }
