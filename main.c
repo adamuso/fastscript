@@ -294,6 +294,63 @@ bool check_type_is_assignable_to(uint8_t current_type, uint8_t new_type)
 
 #pragma region --- CONTEXT STACK ---
 
+
+void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
+{
+    uint64_t current_value = context->stack[index];
+    uint8_t current_type = context->stack_type[index];
+
+    if (!check_type_is_assignable_to(current_type, value.type))
+    {
+        printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(current_type), get_stack_type_name(value.type));
+        return;
+    }
+
+    if (current_type == STACK_TYPE_STRUCT || current_type == STACK_TYPE_OBJECT)
+    {
+        object_deref((void*)current_value);
+    }
+
+    if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_OBJECT)
+    {
+        object_ref((void*)value.value);
+    }
+
+    context->stack[index] = value.value;
+    context->stack_type[index] = value.type;
+}
+struct ExecutionContextStackValue context_stack_get_value_at_index(struct ExecutionContext* context, int index)
+{
+    int len = 1;
+
+    if (context->stack_type[index] == STACK_TYPE_STRUCT_INSTANCE)
+    {
+        int len_index = index + 1;
+
+        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_END)
+        {
+            ++len_index;
+        }     
+
+        len = len_index - index;  
+    }
+
+    if (context->stack_type[index] == STACK_TYPE_STRUCT_END)
+    {
+        int len_index = index - 1;
+
+        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_INSTANCE)
+        {
+            --len_index;
+        }     
+
+        len = index - len_index;
+        index = len_index;  
+    }
+
+    return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index], .size = len };
+}
+
 int context_push_stack(struct ExecutionContext* context, uint64_t value, uint8_t type)
 {
     int index = context->stack_index++;
@@ -330,63 +387,6 @@ int context_pop_stack(struct ExecutionContext* context)
     #endif
 
     return context->stack_index;
-}
-
-void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
-{
-    uint64_t current_value = context->stack[index];
-    uint8_t current_type = context->stack_type[index];
-
-    if (!check_type_is_assignable_to(current_type, value.type))
-    {
-        printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(current_type), get_stack_type_name(value.type));
-        return;
-    }
-
-    if (current_type == STACK_TYPE_STRUCT || current_type == STACK_TYPE_OBJECT)
-    {
-        object_deref((void*)current_value);
-    }
-
-    if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_OBJECT)
-    {
-        object_ref((void*)value.value);
-    }
-
-    context->stack[index] = value.value;
-    context->stack_type[index] = value.type;
-}
-
-struct ExecutionContextStackValue context_stack_get_value_at_index(struct ExecutionContext* context, int index)
-{
-    int len = 1;
-
-    if (context->stack_type[index] == STACK_TYPE_STRUCT_INSTANCE)
-    {
-        int len_index = index + 1;
-
-        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_END)
-        {
-            ++len_index;
-        }     
-
-        len = len_index - index;  
-    }
-
-    if (context->stack_type[index] == STACK_TYPE_STRUCT_END)
-    {
-        int len_index = index - 1;
-
-        while (context->stack_type[len_index] != STACK_TYPE_STRUCT_INSTANCE)
-        {
-            --len_index;
-        }     
-
-        len = index - len_index;
-        index = len_index;  
-    }
-
-    return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index], .size = len };
 }
 
 #pragma endregion --- CONTEXT STACK ---
@@ -537,7 +537,7 @@ struct ExecutionContextVariableInfo context_add_variable(
         if (!check_type_is_assignable_to(declaration_type, context->stack_type[stack_index]))
         {
             printf("ERR!: Cannot add variable overriding stack, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(declaration_type), get_stack_type_name(context->stack_type[stack_index]));
-            return;
+            return (struct ExecutionContextVariableInfo) { .index = -1, .variable = NULL };
         }
     }
 
@@ -1082,7 +1082,7 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
 
             // Override values on stack so we create new variables without extra value copy,
             // this moves stack pointer automatically
-            struct ExecutionContextVariableInfo info = context_add_variable(context, scope, identifier, type, arg_stack_value.size, true);
+            struct ExecutionContextVariableInfo info = context_add_variable(context, scope, identifier, type, arg_stack_value.size, NULL, true);
 
             current = context->code[context->position];
 
@@ -1451,8 +1451,8 @@ void exec(const char* code)
     context.global_scope.variable_count = 0;
     context_scope_init(&context);
 
-    context_set_variable_ptr(&context, context_add_global_variable(&context, "print", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
-    context_set_variable_ptr(&context, context_add_global_variable(&context, "add", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_add_global_variable(&context, "print", STACK_TYPE_NATIVE_FUNCTION, 1, NULL), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
+    context_set_variable_ptr(&context, context_add_global_variable(&context, "add", STACK_TYPE_NATIVE_FUNCTION, 1, NULL), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
 
     exec_block(&context);
 }
