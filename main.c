@@ -43,6 +43,7 @@ enum
     NATIVE_TYPE_DOUBLE,
     
     // ???
+    NATIVE_TYPE_VOID,
     NATIVE_TYPE_STRING,
 
     // size depends on the size of the structure
@@ -151,10 +152,8 @@ int main()
         let X = struct { \
             i32 test; \
             \
-            Self new() => { \
-                Self x; \
-                x.test = 17; \
-                x; \
+            i32 new() => { \
+                17 \
             } \
         }; \
         \
@@ -170,7 +169,7 @@ int main()
         \
         b(a); \
         let c = X.new(); \
-        print(c.test); \
+        print(c); \
     ");
 
     // exec("\
@@ -261,9 +260,9 @@ struct ExecutionContextScope
 
 struct ExecutionContextStackValue
 {
-    uint64_t value;
     uint8_t type;
     int size;
+    uint64_t* ptr;
 };
 
 struct ExecutionContext
@@ -295,6 +294,11 @@ struct ExectionContextIdentifierResult
         struct ExecutionContextTypeInfo type_data;
         struct ExecutionContextVariable* variable_data;
     };
+};
+
+struct ExecutionContextStackIterator
+{
+    int stack_index;
 };
 
 int context_eof(struct ExecutionContext* context)
@@ -377,6 +381,8 @@ int get_size_of_type(struct ExecutionContextTypeInfo type_info)
     return get_size_of_native_type(type_info.native);
 }
 
+void destruct_struct(struct ExecutionContextStructDefinition* definition, uint8_t* data);
+
 void destruct_field_list(struct ExecutionContextStructDefinitionFieldList* fields, uint8_t* data)
 {
     for (int i = 0; i < fields->count; i++)
@@ -406,31 +412,6 @@ void destruct_struct(struct ExecutionContextStructDefinition* definition, uint8_
 
 #pragma region --- CONTEXT STACK ---
 
-
-void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
-{
-    uint64_t current_value = context->stack[index];
-    uint8_t current_type = context->stack_type[index];
-
-    if (!check_type_is_assignable_to(current_type, value.type))
-    {
-        printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(current_type), get_stack_type_name(value.type));
-        return;
-    }
-
-    if (current_type == STACK_TYPE_STRUCT || current_type == STACK_TYPE_OBJECT)
-    {
-        object_deref((void*)current_value);
-    }
-
-    if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_OBJECT)
-    {
-        object_ref((void*)value.value);
-    }
-
-    context->stack[index] = value.value;
-    context->stack_type[index] = value.type;
-}
 struct ExecutionContextStackValue context_stack_get_value_at_index(struct ExecutionContext* context, int index)
 {
     int len = 1;
@@ -460,14 +441,94 @@ struct ExecutionContextStackValue context_stack_get_value_at_index(struct Execut
         index = len_index;  
     }
 
-    return (struct ExecutionContextStackValue) { .value = context->stack[index], .type = context->stack_type[index], .size = len };
+    return (struct ExecutionContextStackValue) { 
+        .type = context->stack_type[index], 
+        .size = len,
+        .ptr = &context->stack[index] 
+    };
 }
 
-int context_push_stack(struct ExecutionContext* context, uint64_t value, uint8_t type)
+void context_stack_reset_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
 {
-    int index = context->stack_index++;
-    context->stack[index] = value;
-    context->stack_type[index] = type;
+    // method is unsafe, does not care about existing data and references, 
+    // should be only used to initialize or force override stack data
+
+    if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_OBJECT)
+    {
+        // for struct and object value will contain and address to a reference
+        // counted object
+        object_ref(*(void**)value.ptr);
+    }
+    
+    if (value.type == STACK_TYPE_STRUCT_INSTANCE)
+    {
+        // for struct instance, first field will always be its type and it needs to be 
+        // reference counted after adding to the stack
+        object_ref(*(void**)value.ptr);
+
+        memcpy(&context->stack[index], value.ptr, value.size);
+        context->stack_type[index] = value.type;
+
+        int stack_size = (value.size - 1) / 8 + 1;
+
+        for (int i = 1; i < stack_size; i++)
+        {
+            context->stack_type[index + i] = value.type;
+        }
+    }
+    else
+    {
+        // primitive types does not require additional logic
+        context->stack[index] = *value.ptr;
+        context->stack_type[index] = value.type;
+    }
+}
+
+struct ExecutionContextStackValue context_stack_unset_value_at_index(struct ExecutionContext* context, int index)
+{
+    // index should always point at the beggining of the struct
+
+    struct ExecutionContextStackValue current_value = context_stack_get_value_at_index(context, index);
+
+    if (current_value.type == STACK_TYPE_STRUCT || current_value.type == STACK_TYPE_OBJECT)
+    {
+        object_deref(*(void**)current_value.ptr);
+    }
+    else if (current_value.type == STACK_TYPE_STRUCT_INSTANCE)
+    {
+        destruct_struct(*(void**)current_value.ptr, ((uint8_t*)current_value.ptr) + sizeof(void*));
+    }
+
+    return current_value;
+}
+
+void context_stack_set_value_at_index(struct ExecutionContext* context, int index, struct ExecutionContextStackValue value)
+{
+    // index should always point at the beggining of the struct
+
+    struct ExecutionContextStackValue current_value = context_stack_unset_value_at_index(context, index);
+
+    if (!check_type_is_assignable_to(current_value.type, value.type))
+    {
+        printf("ERR!: Cannot assign to variable, types are incorrect (to: %s, from: %s)\n", get_stack_type_name(current_value.type), get_stack_type_name(value.type));
+        return;
+    }
+
+    context_stack_reset_value_at_index(context, index, value);
+}
+
+int context_stack_push_value(struct ExecutionContext* context, struct ExecutionContextStackValue value)
+{
+    if (value.size <= 0)
+    {
+        return -1;
+    }
+
+    int stack_size = (value.size - 1) / 8 + 1;
+    int index = context->stack_index;
+    context->stack_index += stack_size;
+
+    context_stack_reset_value_at_index(context, index, value);
 
     #ifdef TOKEN_DEBUG
         int start_stack_index = context->stack_index;
@@ -477,7 +538,7 @@ int context_push_stack(struct ExecutionContext* context, uint64_t value, uint8_t
     return index;
 }
 
-int context_pop_stack(struct ExecutionContext* context)
+int context_stack_pop_value(struct ExecutionContext* context)
 {
     if (context->stack_index == 0) 
     {
@@ -485,12 +546,7 @@ int context_pop_stack(struct ExecutionContext* context)
         return 0;
     }
 
-    struct ExecutionContextStackValue current_value = context_stack_get_value_at_index(context, context->stack_index - 1);
-
-    if (current_value.type == STACK_TYPE_STRUCT || current_value.type == STACK_TYPE_OBJECT)
-    {
-        object_deref((void*)current_value.value);
-    }
+    struct ExecutionContextStackValue current_value = context_stack_unset_value_at_index(context, context->stack_index - 1);
 
     context->stack_index -= current_value.size;
 
@@ -500,6 +556,23 @@ int context_pop_stack(struct ExecutionContext* context)
 
     return context->stack_index;
 }
+
+struct ExecutionContextStackIterator context_stack_iterate(struct ExecutionContext* context)
+{
+    return (struct ExecutionContextStackIterator) {
+        .stack_index = context->stack_index - 1
+    };
+}
+
+struct ExecutionContextStackValue context_stack_iterator_next(struct ExecutionContext* context, struct ExecutionContextStackIterator* iterator)
+{
+    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, iterator->stack_index);
+
+    iterator->stack_index -= value.size;
+
+    return value;
+}
+
 
 #pragma endregion --- CONTEXT STACK ---
 
@@ -593,30 +666,19 @@ struct ExecutionContextVariable* context_scope_add_variable(
 
 #pragma endregion --- CONTEXT SCOPE ---
 
-void context_set_variable_(struct ExecutionContext* context, struct ExecutionContextVariable* info, uint64_t value, uint8_t type)
+void context_variable_set_value(struct ExecutionContext* context, struct ExecutionContextVariable* info, struct ExecutionContextStackValue value)
 {
-    context_stack_set_value_at_index(context, info->stack_index, (struct ExecutionContextStackValue) { .value = value, .type = type });
+    context_stack_set_value_at_index(context, info->stack_index, value);
 }
 
-void context_set_variable(struct ExecutionContext* context, struct ExecutionContextVariable* variable, uint64_t value, uint8_t type)
-{
-    context_set_variable_(context, variable, value, type);
-}
-
-void context_set_variable_ptr(struct ExecutionContext* context, struct ExecutionContextVariable* variable, void* ptr, uint8_t type)
-{
-    context_set_variable_(context, variable, (uint64_t)ptr, type);
-}
-
-struct ExecutionContextStackValue context_get_variable(struct ExecutionContext* context, struct ExecutionContextVariable* variable)
+struct ExecutionContextStackValue context_variable_get_value(struct ExecutionContext* context, struct ExecutionContextVariable* variable)
 {
     return context_stack_get_value_at_index(context, variable->stack_index);
 }
 
-void context_push_variable_into_stack(struct ExecutionContext* context, struct ExecutionContextVariable* variable)
+void context_variable_push_into_stack(struct ExecutionContext* context, struct ExecutionContextVariable* variable)
 {
-    struct ExecutionContextStackValue value = context_get_variable(context, variable);
-    context_push_stack(context, value.value, value.type);
+    context_stack_push_value(context, context_variable_get_value(context, variable));
 }
 
 struct ExecutionContextVariable* context_add_variable(
@@ -777,7 +839,8 @@ struct ExecutionContextTypeInfo context_get_type_from_identifier(
             if (stack_value.type == STACK_TYPE_STRUCT)
             {
                 type_info.native = STACK_TYPE_STRUCT_INSTANCE;
-                type_info.complex = (struct ExecutionContextStructDefinition*)stack_value.value;
+                type_info.complex = *(struct ExecutionContextStructDefinition**)stack_value.ptr;
+                context_variable_push_into_stack(context, variable);
             }
         }
     }
@@ -907,7 +970,10 @@ switch (flags)
     }
 #endif
 
-    context_push_stack(context, value, NATIVE_TYPE_I32);
+    context_stack_push_value(
+        context, 
+        (struct ExecutionContextStackValue) { .ptr = &value, .type = NATIVE_TYPE_I32, .size = get_size_of_native_type(NATIVE_TYPE_I32) }
+    );
 }
 
 void exec_function(
@@ -923,7 +989,7 @@ void exec_function(
 
     context_skip_spaces(context);
 
-    int code_start = context->position;
+    uint64_t code_start = context->position;
 
 #ifdef TOKEN_DEBUG
     printf("Function declaration at: %d\n", code_start);
@@ -991,7 +1057,10 @@ void exec_function(
         }
     }
 
-    context_push_stack(context, code_start, STACK_TYPE_FUNCTION);
+    context_stack_push_value(
+        context,
+        (struct ExecutionContextStackValue) { .ptr = &code_start, .type = STACK_TYPE_FUNCTION, .size = get_size_of_native_type(STACK_TYPE_FUNCTION) }
+    );
 }
 
 void exec_bound_function(
@@ -1140,7 +1209,12 @@ void exec_struct(struct ExecutionContext* context)
         context->position++;
     }
 
-    context_push_stack(context, (uint64_t)definition, STACK_TYPE_STRUCT);
+    uint64_t value = (uint64_t)definition;
+
+    context_stack_push_value(
+        context, 
+        (struct ExecutionContextStackValue) { .ptr = &value, .type = STACK_TYPE_STRUCT, .size = get_size_of_native_type(STACK_TYPE_STRUCT) }
+    );
 }
 
 void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVariable* variable) 
@@ -1152,9 +1226,9 @@ void exec_assignment(struct ExecutionContext* context, struct ExecutionContextVa
     printf("Assign value '[%s] %d' to '%s'\n", get_stack_type_name(value.type), context->stack[context->stack_index - 1], variable->name);
 #endif
 
-    context_set_variable_(context, variable, value.value, value.type);
+    context_variable_set_value(context, variable, value);
     
-    context_pop_stack(context);
+    context_stack_pop_value(context);
 }
 
 void exec_variable_declaration(struct ExecutionContext* context, const char* identifier, struct ExecutionContextTypeInfo declaration_type)
@@ -1198,7 +1272,7 @@ void exec_variable_declaration(struct ExecutionContext* context, const char* ide
         return;
     }
 
-    context_set_variable_(context, variable, value.value, value.type);
+    context_variable_set_value(context, variable, value);
 
 #ifdef TOKEN_DEBUG
     printf("Declared variable '%s' with value '[%s] %d'\n", variable->name, get_stack_type_name(value.type), context->stack[context->stack_index - 1]);
@@ -1237,7 +1311,7 @@ struct ExectionContextIdentifierResult exec_identifier(struct ExecutionContext* 
             return result;
         }
 
-        context_push_variable_into_stack(context, variable);
+        context_variable_push_into_stack(context, variable);
     }
     else 
     {
@@ -1246,6 +1320,41 @@ struct ExectionContextIdentifierResult exec_identifier(struct ExecutionContext* 
     }
 
     return result;
+}
+
+void exec_field_access(struct ExecutionContext* context)
+{
+    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+    struct ExecutionContextStructDefinitionFieldList* fields = NULL;
+    uint8_t* data;
+
+    if (value.type == STACK_TYPE_STRUCT)
+    {
+        struct ExecutionContextStructDefinition* definition = *(struct ExecutionContextStructDefinition**)value.ptr;
+        fields = &definition->static_fields;
+        data = definition->static_data;
+    }
+    else if (value.type == STACK_TYPE_STRUCT_INSTANCE)
+    {
+        struct ExecutionContextStructDefinition* definition = *(struct ExecutionContextStructDefinition**)value.ptr;
+        fields = &definition->fields;
+        data = ((uint8_t*)value.ptr) + sizeof(struct ExecutionContextStructDefinition*);
+    }
+    else if (value.type == STACK_TYPE_OBJECT)
+    {
+        uint8_t* heap_data = (uint8_t*)value.ptr;
+        struct ExecutionContextStructDefinition* definition = *(struct ExecutionContextStructDefinition**)heap_data;
+        fields = &definition->fields;
+        data = heap_data + sizeof(struct ExecutionContextStructDefinition*);
+    }
+
+    struct ExecutionContextStructFieldDefinition* field = NULL;
+    uint8_t* field_data = data + field->offset;
+
+    context_stack_push_value(
+        context,
+        (struct ExecutionContextStackValue) { .ptr = (uint64_t*)field_data, .type = field->type.native, .size = get_size_of_type(field->type) }
+    );
 }
 
 int exec_call_args(struct ExecutionContext* context, int start_stack_index) 
@@ -1290,14 +1399,14 @@ void exec_call_cleanup(struct ExecutionContext* context, int frame_start_stack_i
 
     for (int i = 0; i < to_pop; i++)
     {
-        context_pop_stack(context);
+        context_stack_pop_value(context);
     }
 }
 
 void exec_call_native_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
 {
 #ifdef TOKEN_DEBUG
-    printf("Calling function at address: %p\n", stack_value.value);
+    printf("Calling function at address: %p\n", *stack_value.ptr);
 #endif
 
     if (stack_value.type != STACK_TYPE_NATIVE_FUNCTION)
@@ -1308,7 +1417,7 @@ void exec_call_native_function(struct ExecutionContextStackValue stack_value, st
 
     char current = context->code[context->position];
 
-    void(*func)(struct ExecutionContext*) = (void*)stack_value.value;
+    void(*func)(struct ExecutionContext*) = *(void**)stack_value.ptr;
     int frame_start_stack_index = context->stack_index;
 
     #ifdef TOKEN_DEBUG
@@ -1329,7 +1438,7 @@ void exec_call_native_function(struct ExecutionContextStackValue stack_value, st
 void exec_call_function(struct ExecutionContextStackValue stack_value, struct ExecutionContext* context)
 {
 #ifdef TOKEN_DEBUG
-    printf("Calling function at position: %d\n", stack_value.value);
+    printf("Calling function at position: %d\n", *stack_value.ptr);
 #endif
 
     if (stack_value.type != STACK_TYPE_FUNCTION)
@@ -1340,7 +1449,7 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
 
     // Stack value contains start text position for the function, currently
     // it should point to place directly after '(' character
-    int func_position = stack_value.value;
+    int func_position = *stack_value.ptr;
     // Save start stack index for later, we need to restore it after
     // function call is done 
     int frame_start_stack_index = context->stack_index;
@@ -1521,13 +1630,29 @@ void exec_expression(struct ExecutionContext* context)
         }
         else if (isdigit(current) || current == '.')
         {
-            // 1 -> int32_t
-            // 1.0 -> double
-            // 1.0f -> float
-            // 1u -> uint32_t
-            // 1l -> int64_t
-            // 1lu -> uint64_t
-            exec_number(context);
+            if (current == '.')
+            {
+                struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+
+                if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_STRUCT_INSTANCE || value.type == STACK_TYPE_OBJECT)
+                {
+                    exec_field_access(context);
+                }
+                else 
+                {
+                    exec_number(context);
+                }
+            }
+            else
+            {
+                // 1 -> int32_t
+                // 1.0 -> double
+                // 1.0f -> float
+                // 1u -> uint32_t
+                // 1l -> int64_t
+                // 1lu -> uint64_t
+                exec_number(context);
+            }
         }
         else if (current == '=')
         {
@@ -1549,6 +1674,8 @@ void exec_expression(struct ExecutionContext* context)
         }
         else if (current == '(')
         {
+            struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+
             if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE)
             {
                 // Last expression was identifier representing a type, so this is now
@@ -1671,7 +1798,8 @@ void exec_block(struct ExecutionContext* context)
 
 void fts_print(struct ExecutionContext* context)
 {
-    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+    struct ExecutionContextStackIterator iterator = context_stack_iterate(context);
+    struct ExecutionContextStackValue value = context_stack_iterator_next(context, &iterator);
 
     if (value.type == NATIVE_TYPE_I32) 
     {
@@ -1685,11 +1813,22 @@ void fts_print(struct ExecutionContext* context)
 
 void fts_add(struct ExecutionContext* context)
 {
-    struct ExecutionContextStackValue value = context_stack_get_value_at_index(context, context->stack_index - 1);
+    struct ExecutionContextStackIterator iterator = context_stack_iterate(context);
+    
+    // second parameter
+    struct ExecutionContextStackValue value2 = context_stack_iterator_next(context, &iterator);
+    // first parameter
+    struct ExecutionContextStackValue value = context_stack_iterator_next(context, &iterator);
 
-    if (value.type == NATIVE_TYPE_I32) 
+    if (value.type == NATIVE_TYPE_I32 && value2.type == NATIVE_TYPE_I32) 
     {
-        context_push_stack(context, context->stack[context->stack_index - 1] + context->stack[context->stack_index - 2], NATIVE_TYPE_I32);
+        int32_t result = *(int32_t*)value.ptr + *(int32_t*)value2.ptr;
+        uint64_t value = result;
+
+        context_stack_push_value(
+            context, 
+            (struct ExecutionContextStackValue) { .ptr = &value, .type = NATIVE_TYPE_I32, .size = get_size_of_native_type(NATIVE_TYPE_I32) }
+        );
     }
 }
 
@@ -1708,8 +1847,21 @@ void exec(const char* code)
     context.global_scope.variable_count = 0;
     context_scope_init(&context);
 
-    context_set_variable_ptr(&context, context_add_global_variable(&context, "print", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_print, STACK_TYPE_NATIVE_FUNCTION);
-    context_set_variable_ptr(&context, context_add_global_variable(&context, "add", STACK_TYPE_NATIVE_FUNCTION, 1), &fts_add, STACK_TYPE_NATIVE_FUNCTION);
+    uint64_t fts_print_value = (uint64_t)&fts_print;
+
+    context_variable_set_value(
+        &context, 
+        context_add_global_variable(&context, "print", STACK_TYPE_NATIVE_FUNCTION, 1), 
+        (struct ExecutionContextStackValue) { .ptr = &fts_print_value, .type = STACK_TYPE_NATIVE_FUNCTION, .size = get_size_of_native_type(STACK_TYPE_NATIVE_FUNCTION) }
+    );
+    
+    uint64_t fts_add_value = (uint64_t)&fts_add;
+
+    context_variable_set_value(
+        &context, 
+        context_add_global_variable(&context, "add", STACK_TYPE_NATIVE_FUNCTION, 1), 
+        (struct ExecutionContextStackValue) { .ptr = &fts_add_value, .type = STACK_TYPE_NATIVE_FUNCTION, .size = get_size_of_native_type(STACK_TYPE_NATIVE_FUNCTION) }
+    );
 
     exec_block(&context);
 }
