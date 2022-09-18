@@ -1,0 +1,1 @@
+void exec(const char* code);
