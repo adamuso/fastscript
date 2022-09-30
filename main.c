@@ -28,31 +28,15 @@
 
 int main() 
 {
-    // exec("\
-    //     let X = struct { \
-    //         i32 test; \
-    //         \
-    //         i32 new() => { \
-    //             17 \
-    //         } \
-    //     }; \
-    //     \
-    //     var a = 2; \
-    //     print(a); \
-    //     a = add(a, 10); \
-    //     print(a); \
-    //     \
-    //     var b = void(i32 x) => { \
-    //         x = add(x, 5); \
-    //         print(x); \
-    //     }; \
-    //     \
-    //     b(a); \
-    //     let c = X.new(); \
-    //     print(c); \
-    // ");
-
-     exec("\
+    exec("\
+        let X = struct { \
+            i32 test; \
+            \
+            i32 new() => { \
+                17 \
+            } \
+        }; \
+        \
         var a = 2; \
         print(a); \
         a = add(a, 10); \
@@ -64,7 +48,23 @@ int main()
         }; \
         \
         b(a); \
+        let c = X.new(); \
+        print(c); \
     ");
+
+    //  exec("\
+    //     var a = 2; \
+    //     print(a); \
+    //     a = add(a, 10); \
+    //     print(a); \
+    //     \
+    //     var b = void(i32 x) => { \
+    //         x = add(x, 5); \
+    //         print(x); \
+    //     }; \
+    //     \
+    //     b(a); \
+    // ");
 
     // exec("\
         struct X { \

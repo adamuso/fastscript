@@ -61,6 +61,7 @@ struct ExecutionContextScope
 {
     struct ExecutionContextVariable variables[16];
     int variable_count;
+    int min_stack_index;
 };
 
 struct ExecutionContextStackValue
@@ -75,7 +76,7 @@ struct ExecutionContext
     const char* code;
     int code_len;
     int position;
-    struct ExecutionContextScope global_scope;
+    struct ExecutionContextScope* global_scope;
     struct ExecutionContextScope scopes[16];
     int scope_index;
     uint64_t stack[64];
@@ -84,15 +85,16 @@ struct ExecutionContext
     int stack_variables;
 };
 
-enum ExectionContextIdentifierResultType
+enum ExecutionContextIdentifierResultType
 {
     EXECUTION_CONTEXT_IDENTIFIER_RESULT_HANDLED,
     EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE,
     EXECUTION_CONTEXT_IDENTIFIER_RESULT_VARIABLE,
+    EXECUTION_CONTEXT_IDENTIFIER_RESULT_VALUE,
     EXECUTION_CONTEXT_IDENTIFIER_RESULT_ERROR,
 };
 
-struct ExectionContextIdentifierResult 
+struct ExecutionContextIdentifierResult 
 {
     uint8_t data_type;
     union {

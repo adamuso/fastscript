@@ -9,6 +9,7 @@
 #include "debug.h"
 
 void exec_expression(struct ExecutionContext* context);
+void exec_call_cleanup(struct ExecutionContext* context, int frame_start_stack_index, int args_stack_size);
 
 #pragma region --- Block ---
 
@@ -22,6 +23,7 @@ void exec_block(struct ExecutionContext* context)
 
     int block_stack_index = context->stack_index;
     int block_stack_variables = context->stack_variables;
+    struct ExecutionContextScope* scope = context_get_scope(context);
 
     while (context->position < context->code_len)
     {
@@ -43,6 +45,14 @@ void exec_block(struct ExecutionContext* context)
         if (current == ';')
         {
             context->position++;
+
+            struct ExecutionContextStackIterator iterator = context_stack_iterate(context);
+
+            // Do a cleanup from last statement
+            while(context->stack_index > scope->min_stack_index + scope->variable_count)
+            {
+                context_stack_pop_value(context);
+            } 
         }
 
         context_skip_spaces(context);
@@ -52,13 +62,6 @@ void exec_block(struct ExecutionContext* context)
             debug("--- End parsing statement (stack_index: %d) ---\n", context->stack_index);
         #endif
 
-        struct ExecutionContextStackIterator iterator = context_stack_iterate(context);
-
-        while(context->stack_index != context->stack_variables)
-        {
-            context_stack_pop_value(context);
-        } 
-
         if (current == '}')
         {
             context->position++;
@@ -66,7 +69,10 @@ void exec_block(struct ExecutionContext* context)
         }
     }
 
-    context->stack_index = block_stack_index;
+    // Do a block cleanup
+    exec_call_cleanup(context, block_stack_index, (scope->min_stack_index + scope->variable_count) - block_stack_index);
+
+    // context->stack_index = block_stack_index;
     context->stack_variables = block_stack_variables;
 
     #ifdef TOKEN_DEBUG
@@ -313,6 +319,8 @@ void exec_struct_field(struct ExecutionContext* context, struct ExecutionContext
     parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
     context_skip_spaces(context);
 
+    current = context->code[context->position];
+
     struct ExecutionContextStructFieldDefinition field_definition;
     strncpy(field_definition.name, identifier, MAX_IDENTIFIER_LENGTH);
     field_definition.flags = 0;
@@ -502,7 +510,7 @@ void exec_variable_declaration(struct ExecutionContext* context, const char* ide
 
 #pragma region Struct fields
 
-void exec_field_access(struct ExecutionContext* context)
+struct ExecutionContextIdentifierResult exec_field_access(struct ExecutionContext* context)
 {
     struct ExecutionContextStackValue value = context_stack_get_last_value(context);
     struct ExecutionContextStructDefinitionFieldList* fields = NULL;
@@ -516,9 +524,11 @@ void exec_field_access(struct ExecutionContext* context)
     }
     else if (value.type == STACK_TYPE_STRUCT_INSTANCE)
     {
-        struct ExecutionContextStructDefinition* definition = *(struct ExecutionContextStructDefinition**)value.ptr;
-        fields = &definition->fields;
-        data = ((uint8_t*)value.ptr) + sizeof(struct ExecutionContextStructDefinition*);
+        // TODO: ???
+
+        // struct ExecutionContextStructDefinition* definition = *(struct ExecutionContextStructDefinition**)value.ptr;
+        // fields = &definition->fields;
+        // data = ((uint8_t*)value.ptr) + sizeof(struct ExecutionContextStructDefinition*);
     }
     else if (value.type == STACK_TYPE_OBJECT)
     {
@@ -528,13 +538,48 @@ void exec_field_access(struct ExecutionContext* context)
         data = heap_data + sizeof(struct ExecutionContextStructDefinition*);
     }
 
+    char identifier[MAX_IDENTIFIER_LENGTH];
+    char current = context->code[context->position];
+
+    if (current == '.') 
+    {
+        context->position++;
+    }
+
+    context_skip_spaces(context);
+
+    int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+
     struct ExecutionContextStructFieldDefinition* field = NULL;
+
+    // TODO: implement getting field form fields list
+
+    for (int i = 0; i < fields->count; i++)
+    {
+        if (strncmp(fields->data[i].name, identifier, identifier_length) == 0)
+        {
+            field = &fields->data[i];
+            break;
+        }
+    }
+
     uint8_t* field_data = data + field->offset;
 
     context_stack_push_value(
         context,
         (struct ExecutionContextStackValue) { .ptr = (uint64_t*)field_data, .type = field->type.native, .size = get_size_of_type(field->type) }
     );
+
+    if (field->type.native == STACK_TYPE_STRUCT)
+    {
+        return (struct ExecutionContextIdentifierResult) 
+        { 
+            .data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE,
+            .type_data = field->type
+        };
+    }
+
+    return (struct ExecutionContextIdentifierResult) { .data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_VALUE };
 }
 
 #pragma endregion Struct fields
@@ -587,7 +632,7 @@ void exec_call_cleanup(struct ExecutionContext* context, int frame_start_stack_i
     int return_size = context->stack_index - iterator.stack_index;
 
     #ifdef TOKEN_DEBUG
-    debug("Returned values %d, overall size: %d byte(s)\n", return_count, return_size);
+    debug("Returned values %d, overall size: %d byte(s)\n", return_count, return_size * 8);
     #endif
 
     while(iterator.stack_index != frame_start_stack_index)
@@ -664,15 +709,22 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
         debug("Prepare to call %p\n", func_position);
     #endif
 
+    // Create new scope to which we will push args values
+    struct ExecutionContextScope* scope = context_push_scope(context);
+
+    // Read argument values and push them to the stack from call expression
     int args_stack_size = exec_call_args(context, frame_start_stack_index);
+
+    #ifdef TOKEN_DEBUG
+        debug("Parsed call args, jumping to the function code %p\n", func_position);
+    #endif
 
     int return_position = context->position;
 
+    // Jump to function code
     context->position = func_position;
     context_skip_spaces(context);
     char current = context->code[context->position];
-
-    struct ExecutionContextScope* scope = context_push_scope(context);
 
     if (current != ')')
     {
@@ -785,7 +837,7 @@ void exec_call(struct ExecutionContext* context)
 
 #pragma endregion --- Operators ---
 
-struct ExectionContextIdentifierResult exec_identifier(struct ExecutionContext* context, char* identifier, int max_len)
+struct ExecutionContextIdentifierResult exec_identifier(struct ExecutionContext* context, char* identifier, int max_len)
 {
     int identifier_length = parse_identifier(context, identifier, max_len);
 
@@ -794,7 +846,7 @@ struct ExectionContextIdentifierResult exec_identifier(struct ExecutionContext* 
     if (identifier_length == 6 && strncmp(identifier, "struct", identifier_length) == 0)
     {
         exec_struct(context);
-        return (struct ExectionContextIdentifierResult) { .data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_HANDLED };
+        return (struct ExecutionContextIdentifierResult) { .data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_HANDLED };
     }
 
     // If not a keyword the try to get type from it
@@ -806,7 +858,7 @@ struct ExectionContextIdentifierResult exec_identifier(struct ExecutionContext* 
     struct ExecutionContextTypeInfo type_info = 
         context_get_type_from_identifier(context, identifier, identifier_length, &variable);
 
-    struct ExectionContextIdentifierResult result;
+    struct ExecutionContextIdentifierResult result;
 
     if (type_info.native != 255)
     {
@@ -843,7 +895,7 @@ void exec_expression(struct ExecutionContext* context)
     char current;
     char last_expression = 0;
 
-    struct ExectionContextIdentifierResult last_identifier_result;
+    struct ExecutionContextIdentifierResult last_identifier_result;
 
     last_identifier_result.data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_HANDLED;
 
@@ -903,7 +955,9 @@ void exec_expression(struct ExecutionContext* context)
 
                 if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_STRUCT_INSTANCE || value.type == STACK_TYPE_OBJECT)
                 {
-                    exec_field_access(context);
+                    last_identifier_result = exec_field_access(context);
+
+                    continue;
                 }
                 else 
                 {
@@ -952,7 +1006,7 @@ void exec_expression(struct ExecutionContext* context)
                     last_identifier_result.type_data 
                 );
             }
-            else if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_VARIABLE)
+            else if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_VARIABLE || last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_VALUE)
             {
                 // Last identifier was a variable so this is a call expression
                 context->position++;
@@ -989,6 +1043,10 @@ void exec_expression(struct ExecutionContext* context)
         {
             context->position++;
             exec_block(context);
+        }
+        else if (current == '}')
+        {
+            break;
         }
         else 
         {
@@ -1053,8 +1111,8 @@ void exec(const char* code)
     context.position = 0;
     context.stack_index = 0;
     context.stack_variables = 0;
+    context.global_scope = &context.scopes[0];
 
-    context.global_scope.variable_count = 0;
     context_scope_init(&context);
 
     uint64_t fts_print_value = (uint64_t)&fts_print;

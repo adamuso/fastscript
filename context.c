@@ -302,6 +302,7 @@ struct ExecutionContextStackValue context_stack_iterator_next(struct ExecutionCo
 void context_scope_init(struct ExecutionContext* context)
 {
     context->scopes[context->scope_index].variable_count = 0;
+    context->scopes[context->scope_index].min_stack_index = context->stack_index;
 }
 
 struct ExecutionContextScope* context_get_scope(struct ExecutionContext* context)
@@ -454,7 +455,7 @@ struct ExecutionContextVariable* context_add_global_variable(
     uint8_t declaration_type, 
     size_t size_in_bytes
 ) {
-    return context_add_variable(context, &context->global_scope, name, declaration_type, size_in_bytes, false);
+    return context_add_variable(context, context->global_scope, name, declaration_type, size_in_bytes, false);
 }
 
 struct ExecutionContextVariable* context_lookup_variable(struct ExecutionContext* context, const char* name)
@@ -470,11 +471,11 @@ struct ExecutionContextVariable* context_lookup_variable(struct ExecutionContext
 
     if (lookup < 0)
     {
-        lookup = context_scope_variables_linear_search(&context->global_scope, name);
+        lookup = context_scope_variables_linear_search(context->global_scope, name);
 
         if (lookup >= 0) 
         {
-            return &context->global_scope.variables[lookup];
+            return &context->global_scope->variables[lookup];
         }
 
         #ifdef TOKEN_DEBUG
@@ -509,6 +510,10 @@ struct ExecutionContextTypeInfo context_get_type_from_identifier(
     else if (identifier_length == 3 && strncmp(identifier, "let", 3) == 0)
     {
         type_info.native = STACK_TYPE_ACQUIRE;
+    }
+    else if (identifier_length == 4 && strncmp(identifier, "void", 4) == 0)
+    {
+        type_info.native = NATIVE_TYPE_VOID;
     }
     else if (identifier_length == 3 && strncmp(identifier, "i32", 3) == 0)
     {
