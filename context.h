@@ -39,16 +39,26 @@ void context_struct_definition_field_list_add(
     struct ExecutionContextStructFieldDefinition def
 );
 
+enum ExecutionContextStructDefinitionFlags
+{
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_NONE,
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_STRUCT,
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_CLASS,
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_NEEDS_DESTRUCTOR,
+    EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_TUPLE,
+};
+
 struct ExecutionContextStructDefinition
 {
     struct ExecutionContextStructDefinitionFieldList fields;
     struct ExecutionContextStructDefinitionFieldList static_fields;
-     // 0x1: treat as tuple
-     // 0x2: info about if this type needs a destructor (contains any object that needs to be dereferenced)
+     // see ExecutionContextStructDefinitionFlags
     uint8_t flags; 
     int size;
     int static_size;
     uint8_t* static_data;
+    uint8_t native_type;
 };
 
 struct ExecutionContextVariable
@@ -83,6 +93,7 @@ struct ExecutionContext
     uint8_t stack_type[64];
     int stack_index;
     int stack_variables;
+    struct ExecutionContextStructDefinition native_types[18];
 };
 
 enum ExecutionContextIdentifierResultType
@@ -149,6 +160,8 @@ struct ExecutionContextVariable* context_scope_add_variable(
     const char* name, 
     int stack_index
 );
+
+struct ExecutionContextStackValue context_scope_get_last_value_on_stack_in_scope(struct ExecutionContext* context);
 
 #pragma endregion --- CONTEXT SCOPE ---
 

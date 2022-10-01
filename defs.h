@@ -10,6 +10,7 @@ enum
     STACK_TYPE_ACQUIRE,
 
     // ptr sized
+    NATIVE_TYPE_TYPEDEF,
     STACK_TYPE_STRUCT,
     STACK_TYPE_OBJECT,
     NATIVE_TYPE_PTR,
@@ -24,8 +25,8 @@ enum
     NATIVE_TYPE_U16,
 
     // 32 bits -> 4 bytes
-    NATIVE_TYPE_U32,
     NATIVE_TYPE_I32,
+    NATIVE_TYPE_U32,
     NATIVE_TYPE_FLOAT,
     NATIVE_TYPE_FUNCTION,
 

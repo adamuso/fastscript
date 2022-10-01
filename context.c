@@ -58,7 +58,7 @@ int get_size_of_native_type(uint8_t type)
     {
         return 8;
     }
-    else if (type >= STACK_TYPE_STRUCT && type <= NATIVE_TYPE_NATIVE_FUNCTION)
+    else if (type >= NATIVE_TYPE_TYPEDEF && type <= NATIVE_TYPE_NATIVE_FUNCTION)
     {
         return sizeof(void*);
     }
@@ -70,7 +70,7 @@ int get_size_of_native_type(uint8_t type)
     {
         return 2;
     }
-    else if (type >= NATIVE_TYPE_U32 && type <= NATIVE_TYPE_FUNCTION)
+    else if (type >= NATIVE_TYPE_I32 && type <= NATIVE_TYPE_FUNCTION)
     {
         return 4;
     }
@@ -253,7 +253,7 @@ int context_stack_push_value(struct ExecutionContext* context, struct ExecutionC
     context_stack_reset_value_at_index(context, index, value);
 
     #ifdef TOKEN_DEBUG
-        debug("Pushed to stack (count: %d, value: %d, value_ptr: %p, type: %d)\n", context->stack_index, context->stack[index], context->stack[index], context->stack_type[index]);
+        debug("Pushed to stack (count: %d, value: %d, value_ptr: %p, type: %s)\n", context->stack_index, context->stack[index], context->stack[index], get_stack_type_name(context->stack_type[index]));
     #endif
 
     return index;
@@ -386,6 +386,24 @@ struct ExecutionContextVariable* context_scope_add_variable(
     return &scope->variables[index];
 }
 
+struct ExecutionContextStackValue context_scope_get_last_value_on_stack_in_scope(struct ExecutionContext* context)
+{
+    struct ExecutionContextScope* scope = context_get_scope(context);
+
+    if (context->stack_index == scope->min_stack_index + scope->variable_count)
+    {
+        return (struct ExecutionContextStackValue) 
+        {
+            .ptr = NULL,
+            .size = 0,
+            .type = NATIVE_TYPE_VOID    
+        };
+    }
+
+    return context_stack_get_value_at_index(context, context->stack_index - 1);
+}
+
+
 #pragma endregion --- CONTEXT SCOPE ---
 
 void context_variable_set_value(struct ExecutionContext* context, struct ExecutionContextVariable* info, struct ExecutionContextStackValue value)
@@ -514,46 +532,57 @@ struct ExecutionContextTypeInfo context_get_type_from_identifier(
     else if (identifier_length == 4 && strncmp(identifier, "void", 4) == 0)
     {
         type_info.native = NATIVE_TYPE_VOID;
+        type_info.complex = &context->native_types[NATIVE_TYPE_VOID];
     }
     else if (identifier_length == 3 && strncmp(identifier, "i32", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_I32;
+        type_info.complex = &context->native_types[NATIVE_TYPE_I32];
     }
     else if (identifier_length == 3 && strncmp(identifier, "u32", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_U32;
+        type_info.complex = &context->native_types[NATIVE_TYPE_U32];
     }
     else if (identifier_length == 3 && strncmp(identifier, "f32", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_FLOAT;
+        type_info.complex = &context->native_types[NATIVE_TYPE_FLOAT];
     }
     else if (identifier_length == 3 && strncmp(identifier, "f64", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_DOUBLE;
+        type_info.complex = &context->native_types[NATIVE_TYPE_DOUBLE];
     }
     else if (identifier_length == 3 && strncmp(identifier, "i16", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_I16;
+        type_info.complex = &context->native_types[NATIVE_TYPE_I16];
     }
     else if (identifier_length == 3 && strncmp(identifier, "u16", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_U16;
+        type_info.complex = &context->native_types[NATIVE_TYPE_U16];
     }
     else if (identifier_length == 2 && strncmp(identifier, "i8", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_I8;
+        type_info.complex = &context->native_types[NATIVE_TYPE_I8];
     }
     else if (identifier_length == 2 && strncmp(identifier, "u8", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_U8;
+        type_info.complex = &context->native_types[NATIVE_TYPE_U8];
     }
     else if (identifier_length == 3 && strncmp(identifier, "i64", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_I64;
+        type_info.complex = &context->native_types[NATIVE_TYPE_I64];
     }
     else if (identifier_length == 3 && strncmp(identifier, "u64", 3) == 0)
     {
         type_info.native = NATIVE_TYPE_U64;
+        type_info.complex = &context->native_types[NATIVE_TYPE_U64];
     }
     else 
     {
@@ -561,17 +590,28 @@ struct ExecutionContextTypeInfo context_get_type_from_identifier(
 
         if (variable) 
         {
-            struct ExecutionContextStackValue stack_value = context_stack_get_value_at_index(context, variable->stack_index);
+            struct ExecutionContextStackValue stack_value = context_variable_get_value(context, variable);
 
             if (stack_value.type == STACK_TYPE_STRUCT)
             {
-                type_info.native = STACK_TYPE_STRUCT_INSTANCE;
+                type_info.native = STACK_TYPE_STRUCT;
                 type_info.complex = *(struct ExecutionContextStructDefinition**)stack_value.ptr;
-                context_variable_push_into_stack(context, variable);
             }
         }
 
         *found_variable = variable;
+    }
+
+    if (type_info.complex)
+    {
+        uint64_t value = (uint64_t)type_info.complex;
+
+        context_stack_push_value(context, (struct ExecutionContextStackValue) 
+        {
+            .type = type_info.native == STACK_TYPE_STRUCT ? STACK_TYPE_STRUCT : NATIVE_TYPE_TYPEDEF,
+            .size = get_size_of_native_type(NATIVE_TYPE_TYPEDEF),
+            .ptr = &value 
+        });
     }
 
     return type_info;

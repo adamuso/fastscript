@@ -5,6 +5,7 @@
 const char* stack_type_names[] = 
 {
     "STACK_TYPE_ACQUIRE",
+    "STACK_TYPE_TYPEDEF",
     "STACK_TYPE_STRUCT",
     "STACK_TYPE_OBJECT",
     "NATIVE_TYPE_PTR",
@@ -13,8 +14,8 @@ const char* stack_type_names[] =
     "NATIVE_TYPE_U8",
     "NATIVE_TYPE_I16",
     "NATIVE_TYPE_U16",
-    "NATIVE_TYPE_U32",
     "NATIVE_TYPE_I32",
+    "NATIVE_TYPE_U32",
     "NATIVE_TYPE_FLOAT",
     "NATIVE_TYPE_FUNCTION",
     "NATIVE_TYPE_I64",

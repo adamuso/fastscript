@@ -314,6 +314,11 @@ void exec_struct_field(struct ExecutionContext* context, struct ExecutionContext
     struct ExecutionContextTypeInfo type_info = 
         context_get_type_from_identifier(context, type_identifier, type_identifier_length, NULL);
 
+    if (type_info.complex)
+    {
+        context_stack_pop_value(context);
+    }
+
     char identifier[MAX_IDENTIFIER_LENGTH];
     context_skip_spaces(context);
     parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
@@ -351,6 +356,10 @@ void exec_struct(struct ExecutionContext* context)
     context_skip_spaces(context);
 
     char current = context->code[context->position];
+
+#ifdef TOKEN_DEBUG
+    debug("Parsing struct\n");
+#endif
 
     if (current != '{')
     {
@@ -431,6 +440,10 @@ void exec_struct(struct ExecutionContext* context)
         context, 
         (struct ExecutionContextStackValue) { .ptr = &value, .type = STACK_TYPE_STRUCT, .size = get_size_of_native_type(STACK_TYPE_STRUCT) }
     );
+
+#ifdef TOKEN_DEBUG
+    debug("End parsing struct, fields: %d, static_fields: %d\n", definition->fields.count, definition->static_fields.count);
+#endif
 }
 
 #pragma endregion Struct literal
@@ -733,9 +746,6 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
         char type_identifier[MAX_IDENTIFIER_LENGTH];
         char identifier[MAX_IDENTIFIER_LENGTH];
 
-        // Move stack back to frame start, so we can assign pushed values to variables
-        context->stack_index = frame_start_stack_index;
-
         while (index < args_stack_size)
         {
             // Read the type of the variable
@@ -745,10 +755,20 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
 
             struct ExecutionContextTypeInfo type_info = context_get_type_from_identifier(context, type_identifier, type_identifier_length, NULL);
 
+            if (type_info.complex)
+            {
+                context_stack_pop_value(context);
+            }
+
             // Read the name of the variable
             context_skip_spaces(context);
             parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
             context_skip_spaces(context);
+
+            int current_stack_index = context->stack_index;
+
+            // Move stack back to frame start, so we can assign pushed values to variables
+            context->stack_index = frame_start_stack_index + index;
 
             // Get pushed value at current index which will be assigned to variable
             struct ExecutionContextStackValue arg_stack_value = context_stack_get_value_at_index(context, frame_start_stack_index + index);
@@ -764,6 +784,8 @@ void exec_call_function(struct ExecutionContextStackValue stack_value, struct Ex
                 arg_stack_value.size, 
                 true
             );
+
+            context->stack_index = current_stack_index;
 
             current = context->code[context->position];
 
@@ -908,6 +930,8 @@ void exec_expression(struct ExecutionContext* context)
         context_skip_spaces(context);
         current = context->code[context->position];
 
+        struct ExecutionContextStackValue last_stack_value = context_scope_get_last_value_on_stack_in_scope(context);
+
         #ifdef TOKEN_DEBUG
             debug("TOKEN: %c\n", current);
         #endif
@@ -916,12 +940,17 @@ void exec_expression(struct ExecutionContext* context)
         {
             char identifier[MAX_IDENTIFIER_LENGTH];
 
-            if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE)
+            if (last_stack_value.type == NATIVE_TYPE_TYPEDEF || last_stack_value.type == STACK_TYPE_STRUCT || last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE)
             {
                 last_identifier_result.data_type = EXECUTION_CONTEXT_IDENTIFIER_RESULT_HANDLED;
 
                 // Last expression was identifier representing a type, so this is a variable declaration
                 context_skip_spaces(context);
+
+                #ifdef TOKEN_DEBUG
+                    debug("Parsing variable declaration\n");
+                #endif
+
 
                 int identifier_length = parse_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
 
@@ -933,11 +962,28 @@ void exec_expression(struct ExecutionContext* context)
                     return;
                 }
 
-                exec_variable_declaration(context, identifier, last_identifier_result.type_data);
+                if (last_stack_value.type == NATIVE_TYPE_TYPEDEF || last_stack_value.type == STACK_TYPE_STRUCT)
+                {
+                    struct ExecutionContextStructDefinition* def = (struct ExecutionContextStructDefinition*)*last_stack_value.ptr;
+                    exec_variable_declaration(context, identifier, (struct ExecutionContextTypeInfo) { .native = last_stack_value.type, .complex = def });
+                }
+                else 
+                {
+                    exec_variable_declaration(context, identifier, last_identifier_result.type_data);
+                }
+
+                #ifdef TOKEN_DEBUG
+                    debug("End parsing variable declaration\n");
+                #endif
+
                 continue;
             }        
 
             last_identifier_result = exec_identifier(context, identifier, MAX_IDENTIFIER_LENGTH);
+
+            #ifdef TOKEN_DEBUG
+                debug("Found identifier: %s\n", identifier);
+            #endif
 
             if (last_identifier_result.data_type >= EXECUTION_CONTEXT_IDENTIFIER_RESULT_ERROR)
             {
@@ -951,9 +997,7 @@ void exec_expression(struct ExecutionContext* context)
         {
             if (current == '.')
             {
-                struct ExecutionContextStackValue value = context_stack_get_last_value(context);
-
-                if (value.type == STACK_TYPE_STRUCT || value.type == STACK_TYPE_STRUCT_INSTANCE || value.type == STACK_TYPE_OBJECT)
+                if (last_stack_value.type == STACK_TYPE_STRUCT || last_stack_value.type == STACK_TYPE_STRUCT_INSTANCE || last_stack_value.type == STACK_TYPE_OBJECT)
                 {
                     last_identifier_result = exec_field_access(context);
 
@@ -995,20 +1039,18 @@ void exec_expression(struct ExecutionContext* context)
         }
         else if (current == '(')
         {
-            struct ExecutionContextStackValue value = context_stack_get_last_value(context);
-
-            if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_TYPE)
+            if (last_stack_value.type == STACK_TYPE_STRUCT || last_stack_value.type == NATIVE_TYPE_TYPEDEF)
             {
-                // Last expression was identifier representing a type, so this is now
+                // Last stack value is a type defintion, so this is now
                 // a function declaration
                 exec_function(
                     context, 
                     last_identifier_result.type_data 
                 );
             }
-            else if (last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_VARIABLE || last_identifier_result.data_type == EXECUTION_CONTEXT_IDENTIFIER_RESULT_VALUE)
+            else if (last_stack_value.type == NATIVE_TYPE_FUNCTION || last_stack_value.type == NATIVE_TYPE_NATIVE_FUNCTION)
             {
-                // Last identifier was a variable so this is a call expression
+                // Last stack value is a function so this is a call expression
                 context->position++;
                 exec_call(context);
             } 
@@ -1102,6 +1144,179 @@ void fts_add(struct ExecutionContext* context)
 
 #pragma endregion --- SCRIPT FUNCTIONS ---
 
+void context_native_types_default_initialize(struct ExecutionContext* context)
+{
+    context->native_types[NATIVE_TYPE_TYPEDEF] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = sizeof(void*),
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_TYPEDEF
+    };
+
+    context->native_types[STACK_TYPE_STRUCT] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE | EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_NEEDS_DESTRUCTOR,
+        .size = sizeof(void*),
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = STACK_TYPE_STRUCT
+    };
+
+    context->native_types[STACK_TYPE_OBJECT] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE | EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_NEEDS_DESTRUCTOR,
+        .size = sizeof(void*),
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = STACK_TYPE_OBJECT
+    };
+
+    context->native_types[NATIVE_TYPE_PTR] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = sizeof(void*),
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_PTR
+    };
+
+    context->native_types[NATIVE_TYPE_NATIVE_FUNCTION] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = sizeof(void*),
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_NATIVE_FUNCTION
+    };
+
+    context->native_types[NATIVE_TYPE_I8] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 1,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_I8
+    };
+
+    context->native_types[NATIVE_TYPE_U8] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 1,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_U8
+    };
+
+    context->native_types[NATIVE_TYPE_I16] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 2,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_I16
+    };
+
+    context->native_types[NATIVE_TYPE_U16] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 2,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_U16
+    };
+
+    context->native_types[NATIVE_TYPE_I32] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 4,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_I32
+    };
+
+    context->native_types[NATIVE_TYPE_U32] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 4,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_U32
+    };
+
+    context->native_types[NATIVE_TYPE_FLOAT] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 4,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_FLOAT
+    };
+
+    context->native_types[NATIVE_TYPE_FUNCTION] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 4,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_FUNCTION
+    };
+
+    context->native_types[NATIVE_TYPE_I64] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 8,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_I64
+    };
+
+    context->native_types[NATIVE_TYPE_U64] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 8,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_U64
+    };
+
+    context->native_types[NATIVE_TYPE_DOUBLE] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 8,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_DOUBLE
+    };
+
+    context->native_types[NATIVE_TYPE_VOID] = (struct ExecutionContextStructDefinition) {
+        .fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .static_fields = (struct ExecutionContextStructDefinitionFieldList) { .capacity = 0, .count = 0 },
+        .flags = EXECUTION_CONTEXT_STRUCT_DEFINITION_FLAG_IS_NATIVE,
+        .size = 0,
+        .static_size = 0,
+        .static_data = NULL,
+        .native_type = NATIVE_TYPE_VOID
+    };
+}
+
 void exec(const char* code)
 {
     struct ExecutionContext context;
@@ -1113,6 +1328,7 @@ void exec(const char* code)
     context.stack_variables = 0;
     context.global_scope = &context.scopes[0];
 
+    context_native_types_default_initialize(&context);
     context_scope_init(&context);
 
     uint64_t fts_print_value = (uint64_t)&fts_print;
